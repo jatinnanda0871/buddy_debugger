@@ -1,0 +1,9 @@
+# This repo is developed on Windows and run on Linux, so normalise line
+# endings to LF everywhere. Without this, files churn between CRLF and LF as
+# they move between machines and every diff looks like a full rewrite.
+* text=auto eol=lf
+
+# Keep the fake MI/DAP fixtures byte-exact: their tests assert on
+# whitespace-sensitive protocol output.
+tests/fake_gdb.py text eol=lf
+tests/fake_bridge.py text eol=lf

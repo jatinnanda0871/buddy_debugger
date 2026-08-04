@@ -1,0 +1,63 @@
+{
+  "name": "gdb-mcp-bridge",
+  "displayName": "GDB MCP Bridge",
+  "description": "Exposes the active VS Code debug session to a local AI agent over DAP.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "gdbMcpBridge.showStatus",
+        "title": "GDB MCP Bridge: Show Status",
+        "category": "GDB MCP"
+      },
+      {
+        "command": "gdbMcpBridge.restart",
+        "title": "GDB MCP Bridge: Restart Server",
+        "category": "GDB MCP"
+      },
+      {
+        "command": "gdbMcpBridge.copyEndpoint",
+        "title": "GDB MCP Bridge: Copy Endpoint Info",
+        "category": "GDB MCP"
+      }
+    ],
+    "configuration": {
+      "title": "GDB MCP Bridge",
+      "properties": {
+        "gdbMcpBridge.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run the local bridge server so an AI agent can inspect debug sessions."
+        },
+        "gdbMcpBridge.transport": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "unix",
+            "tcp"
+          ],
+          "default": "auto",
+          "description": "auto uses a Unix domain socket on Linux/macOS (permission-scoped to your user) and a loopback TCP port on Windows."
+        },
+        "gdbMcpBridge.port": {
+          "type": "number",
+          "default": 0,
+          "description": "TCP port when transport is tcp. 0 picks a free port."
+        }
+      }
+    }
+  }
+}
