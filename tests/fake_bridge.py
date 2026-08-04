@@ -19,6 +19,7 @@ class FakeBridge:
         self.token = token
         self.server: asyncio.AbstractServer | None = None
         self.port = 0
+        self.socket_path: str | None = None
 
         self.seq = 0
         self.events: list[dict[str, Any]] = []
@@ -44,6 +45,11 @@ class FakeBridge:
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
         self.port = self.server.sockets[0].getsockname()[1]
 
+    async def start_unix(self, path: str) -> None:
+        """Serve over a Unix domain socket, as the extension does on Linux."""
+        self.socket_path = path
+        self.server = await asyncio.start_unix_server(self._handle, path)
+
     async def stop(self) -> None:
         if self.server is not None:
             self.server.close()
@@ -51,16 +57,20 @@ class FakeBridge:
             self.server = None
 
     def discovery_info(self, **overrides: Any) -> dict[str, Any]:
-        info = {
+        info: dict[str, Any] = {
             "pid": os.getpid(),
             "token": self.token,
-            "transport": "tcp",
-            "host": "127.0.0.1",
-            "port": self.port,
             "startedAt": int(time.time() * 1000),
             "workspaceName": "test",
             "workspaceFolders": [f["path"] for f in self.workspace_folders],
         }
+        if self.socket_path:
+            info["transport"] = "unix"
+            info["socketPath"] = self.socket_path
+        else:
+            info["transport"] = "tcp"
+            info["host"] = "127.0.0.1"
+            info["port"] = self.port
         info.update(overrides)
         return info
 

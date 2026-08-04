@@ -8,7 +8,10 @@ version = "0.1.0"
 description = "Drive GDB from an AI agent over GDB/MI, via MCP or as a plain library."
 requires-python = ">=3.10"
 license = { text = "MIT" }
-dependencies = ["mcp>=1.2.0"]
+# Pinned exactly: mcp 2.0 removed APIs this server and its tests rely on
+# (e.g. mcp.shared.memory.create_connected_server_and_client_session), so an
+# unpinned install resolves to a version that does not work.
+dependencies = ["mcp==1.27.0"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-asyncio>=0.23"]

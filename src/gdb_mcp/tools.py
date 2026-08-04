@@ -236,6 +236,20 @@ class Debugger:
             )
         return session
 
+    async def _ensure_session(self, name: str) -> GdbSession:
+        """Get the session, starting one if it does not exist yet.
+
+        gdb_attach and gdb_load_core read like complete operations -- they name
+        the target themselves -- so requiring a separate gdb_start first is a
+        trap. They open their own session instead.
+        """
+        existing = self.sessions.get(name)
+        if existing is not None and existing.alive:
+            return existing
+        self.sessions.pop(name, None)
+        await self.start(session=name)
+        return self.get(name)
+
     async def start(
         self,
         *,
@@ -297,7 +311,7 @@ class Debugger:
     async def attach(
         self, pid: int, *, binary: str | None = None, session: str = "default"
     ) -> dict[str, Any]:
-        gdb = self.get(session)
+        gdb = await self._ensure_session(session)
         if binary:
             await self.load_binary(binary, session=session)
         gdb.drain_stops()
@@ -313,7 +327,7 @@ class Debugger:
     async def load_core(
         self, binary: str, core: str, *, session: str = "default"
     ) -> dict[str, Any]:
-        gdb = self.get(session)
+        gdb = await self._ensure_session(session)
         await self.load_binary(binary, session=session)
         core_path = os.path.abspath(os.path.expanduser(core))
         if not os.path.exists(core_path):
@@ -636,7 +650,9 @@ class Debugger:
 
         command = f"-data-read-memory {address} x {word_size} {rows} {cols}"
         if as_char:
-            command += " 46"  # '.' for non-printable characters
+            # GDB wants the literal replacement character here, not its ASCII
+            # code: passing "46" makes every unprintable byte render as '4'.
+            command += " ."
         result = await gdb.send(command)
         payload = result.payload
 
@@ -758,17 +774,20 @@ class Debugger:
     ) -> dict[str, Any]:
         gdb = self.get(session)
         mode = 5 if with_source else 0
-        if location:
-            command = f"-data-disassemble -s {location} -e \"{location}+{count * 8}\" -- {mode}"
-        else:
-            command = f"-data-disassemble -- {mode}"
+        # GDB requires an explicit location: the bare `-data-disassemble -- N`
+        # form is rejected outright ("Usage: -f | -s/-e | -a"). `-a` covers the
+        # function containing an address, which is what a caller means by
+        # "disassemble here".
+        target = location or "$pc"
         try:
-            result = await gdb.send(command)
+            result = await gdb.send(f"-data-disassemble -a {target} -- {mode}")
         except GdbError:
-            # mode 5 (source+opcodes) needs GDB >= 7.11; retry plainly.
-            fallback = command.rsplit("--", 1)[0] + "-- 0"
-            result = await gdb.send(fallback)
-        return {"instructions": _as_list(result.payload.get("asm_insns"))[:count]}
+            # mode 5 (source + opcodes) needs GDB >= 7.11; retry plainly.
+            result = await gdb.send(f"-data-disassemble -a {target} -- 0")
+        return {
+            "location": target,
+            "instructions": _as_list(result.payload.get("asm_insns"))[:count],
+        }
 
     async def list_source(
         self,
@@ -795,7 +814,17 @@ class Debugger:
 
     async def program_output(self, *, session: str = "default") -> dict[str, Any]:
         gdb = self.get(session)
-        return {"output": truncate(gdb.read_program_output(), 8000)}
+        text = truncate(gdb.read_program_output(), 8000)
+        out: dict[str, Any] = {"output": text}
+        if not text:
+            # Reads drain the buffer, and every stop folds pending output into
+            # its own result. Empty means "nothing new", not "printed nothing".
+            out["note"] = (
+                "No output since it was last reported. Output is delivered "
+                "once: anything the program printed earlier was included in "
+                "the preceding run, step or continue result."
+            )
+        return out
 
     async def raw(
         self, command: str, *, session: str = "default", timeout: float = 60.0

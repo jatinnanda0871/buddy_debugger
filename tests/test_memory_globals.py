@@ -336,11 +336,16 @@ async def test_gdb_memory_requests_the_right_geometry(gdb_debugger):
     await gdb_debugger.read_memory("0x1000", count=8, word_size=4)
     command = next(c for c in sent if c.startswith("-data-read-memory "))
     # 8 words of 4 bytes, 4 per row -> hex format, 2 rows x 4 cols, ascii on
-    assert command == "-data-read-memory 0x1000 x 4 2 4 46"
+    assert command == "-data-read-memory 0x1000 x 4 2 4 ."
 
 
 async def test_gdb_memory_always_requests_the_ascii_gutter(gdb_debugger):
-    """The gutter must not be tied to byte-sized words, which no longer exist."""
+    """The gutter must not be tied to byte-sized words, which no longer exist.
+
+    The trailing argument is the literal character GDB substitutes for
+    unprintable bytes. It must be '.', not the ASCII code 46 -- passing "46"
+    makes GDB render every unprintable byte as '4'.
+    """
     session = gdb_debugger.get("default")
     sent = []
     original = session.send
@@ -352,7 +357,7 @@ async def test_gdb_memory_always_requests_the_ascii_gutter(gdb_debugger):
     session.send = record
     await gdb_debugger.read_memory("0x1000", count=4, word_size=8)
     command = next(c for c in sent if c.startswith("-data-read-memory "))
-    assert command.endswith(" 46")
+    assert command.endswith(" .")
 
 
 async def test_gdb_memory_rejects_sub_word_sizes(gdb_debugger):
