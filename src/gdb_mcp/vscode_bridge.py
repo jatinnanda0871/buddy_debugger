@@ -309,8 +309,16 @@ class BridgeClient:
 class VSCodeDebugger:
     """Tool surface over a live VS Code debug session."""
 
-    def __init__(self, workspace: str | None = None) -> None:
+    def __init__(
+        self, workspace: str | None = None, *, hex_output: bool = True
+    ) -> None:
         self.workspace = workspace
+        #: Match the gdb_* backend's `set output-radix 16`, so the same
+        #: variable does not read 0x11 through one backend and 17 through the
+        #: other. This is the user's own session, so it also changes what the
+        #: Variables pane and hover tooltips show -- hence the opt-out.
+        self.hex_output = hex_output
+        self._hex_configured: set[str] = set()
         self._client: BridgeClient | None = None
 
     def client(self, *, refresh: bool = False) -> BridgeClient:
@@ -415,6 +423,9 @@ class VSCodeDebugger:
         if not wait_for_stop:
             return out
         event, _seq = await self._await_stop(before, timeout)
+        if event is not None and event.get("type") == "stopped":
+            with contextlib.suppress(BridgeError):
+                await self._ensure_hex_output()
         out["stop"] = await self._describe_event(event)
         return out
 
@@ -594,6 +605,7 @@ class VSCodeDebugger:
         self, frame_id: int, *, expand_depth: int = 1, max_children: int = 60
     ) -> dict[str, Any]:
         """Scopes and variables for a frame, with children expanded one level."""
+        await self._ensure_hex_output()
         scopes_result = await self._dap("scopes", {"frameId": int(frame_id)})
         out: dict[str, Any] = {"frame_id": frame_id, "scopes": []}
         for scope in (scopes_result or {}).get("scopes", []):
@@ -645,6 +657,7 @@ class VSCodeDebugger:
         frame_id: int | None = None,
         context: str = "watch",
     ) -> dict[str, Any]:
+        await self._ensure_hex_output()
         if frame_id is None:
             frame_id = await self._top_frame_id()
         args: dict[str, Any] = {"expression": expression, "context": context}
@@ -695,6 +708,28 @@ class VSCodeDebugger:
             "work with any adapter. For GDB features on Windows, set the "
             "launch.json type to 'cppdbg' with a MinGW or WSL gdb."
         )
+
+    async def _ensure_hex_output(self) -> None:
+        """Put a GDB-backed session into hex, once, before reading values.
+
+        Applied lazily rather than on connect because scenario one is the user
+        pressing F5 themselves -- there is no launch call to hook.
+        """
+        if not self.hex_output:
+            return
+        session = await self._active_session()
+        if session is None:
+            return
+        session_id = session.get("id")
+        if not session_id or session_id in self._hex_configured:
+            return
+        # Record first: a non-GDB adapter can never be configured, and a
+        # failure should not be retried on every single evaluation.
+        self._hex_configured.add(session_id)
+        if session.get("type") not in GDB_BACKED_TYPES:
+            return
+        with contextlib.suppress(BridgeError):
+            await self.exec_gdb("set output-radix 16", tool_name="vsc_eval")
 
     async def exec_gdb(
         self, command: str, *, tool_name: str = "vsc_exec"

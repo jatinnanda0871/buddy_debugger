@@ -438,3 +438,56 @@ async def test_client_speaks_http_over_a_unix_socket(tmp_path, monkeypatch):
         assert bt["frames"][0]["name"] == "parse_header"
     finally:
         await fake.stop()
+
+
+# -- hex output parity with the gdb_* backend ---------------------------------
+
+
+async def test_gdb_backed_session_is_switched_to_hex(bridge, debugger):
+    """Otherwise the same variable reads 0x11 via gdb_eval and 17 via vsc_eval."""
+    bridge.add_session(type="cppdbg")
+    bridge.set_stopped(thread_id=1)
+    bridge.dap_responses["stackTrace"] = {"stackFrames": [{"id": 1, "name": "f"}]}
+    bridge.dap_responses["evaluate"] = {"result": "0x11"}
+
+    await debugger.evaluate("g_connection_count")
+    sent = [args["expression"] for name, args in bridge.dap_calls if name == "evaluate"]
+    assert "-exec set output-radix 16" in sent, sent
+
+
+async def test_hex_is_configured_once_per_session(bridge, debugger):
+    bridge.add_session(type="cppdbg")
+    bridge.set_stopped(thread_id=1)
+    bridge.dap_responses["stackTrace"] = {"stackFrames": [{"id": 1, "name": "f"}]}
+    bridge.dap_responses["evaluate"] = {"result": "0x11"}
+
+    for _ in range(3):
+        await debugger.evaluate("g_connection_count")
+    sent = [args["expression"] for name, args in bridge.dap_calls if name == "evaluate"]
+    assert sent.count("-exec set output-radix 16") == 1, sent
+
+
+async def test_non_gdb_adapters_are_left_alone(bridge, debugger):
+    """debugpy has no `-exec`; attempting it would just raise every call."""
+    bridge.add_session(type="debugpy")
+    bridge.set_stopped(thread_id=1)
+    bridge.dap_responses["stackTrace"] = {"stackFrames": [{"id": 1, "name": "f"}]}
+    bridge.dap_responses["evaluate"] = {"result": "17"}
+
+    await debugger.evaluate("g_connection_count")
+    sent = [args["expression"] for name, args in bridge.dap_calls if name == "evaluate"]
+    assert not any("output-radix" in expr for expr in sent), sent
+
+
+async def test_hex_output_can_be_switched_off(bridge):
+    from gdb_mcp.vscode_bridge import VSCodeDebugger
+
+    plain = VSCodeDebugger(hex_output=False)
+    bridge.add_session(type="cppdbg")
+    bridge.set_stopped(thread_id=1)
+    bridge.dap_responses["stackTrace"] = {"stackFrames": [{"id": 1, "name": "f"}]}
+    bridge.dap_responses["evaluate"] = {"result": "17"}
+
+    await plain.evaluate("g_connection_count")
+    sent = [args["expression"] for name, args in bridge.dap_calls if name == "evaluate"]
+    assert not any("output-radix" in expr for expr in sent), sent

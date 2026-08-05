@@ -190,9 +190,16 @@ accepts expressions (`&buf`, `pkt->payload`) rather than only raw addresses — 
 evaluates them to an address first. It renders the same rows, not the base64
 blob DAP actually carries.
 
-**Everything else is hex too.** Sessions start with `set output-radix 16`, so
-evaluated expressions, locals and register values all print in hex and agree
-with the memory dumps rather than mixing radices.
+**Everything else is hex too.** Both backends set `set output-radix 16`, so
+evaluated expressions, locals and register values print in hex and agree with
+the memory dumps rather than mixing radices — `gdb_eval` and `vsc_eval` return
+`0x11` for the same variable, not `0x11` and `17`.
+
+For `vsc_*` this is applied once per GDB-backed session, which also changes
+what **your** Variables pane and hover tooltips show, since it is your session.
+Set `GDB_MCP_VSCODE_HEX=0` to leave the editor in decimal; the `gdb_*` backend
+is unaffected either way. Adapters with no GDB underneath (debugpy, cppvsdbg)
+are never touched.
 
 ## Design notes
 
@@ -322,8 +329,8 @@ The contract tests exist because the fake is otherwise free to drift: they
 compare the extension's route table, discovery descriptor and event fields
 against both the fake and the client, statically, with no Node required.
 
-Typical counts: 167 passed / 33 skipped on Linux with gdb; 126 / 74 on Windows
-without it; 159 / 41 on Windows with the bridge opted in and WSL available.
+Typical counts: 171 passed / 35 skipped on Linux with gdb; 130 / 76 on Windows
+without it; 165 / 41 on Windows with the bridge opted in and WSL available.
 
 Standalone GDB smoke test:
 

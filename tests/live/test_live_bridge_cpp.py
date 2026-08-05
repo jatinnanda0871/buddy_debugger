@@ -254,7 +254,8 @@ async def test_disassembly_over_cppdbg(cpp_paused):
 
 async def test_evaluate_a_scalar_over_cppdbg(cpp_paused):
     bridge, _stop = cpp_paused
-    assert "4096" in (await bridge.evaluate("limit"))["value"]
+    # Hex, matching the gdb_* backend: 4096 == 0x1000.
+    assert (await bridge.evaluate("limit"))["value"] == "0x1000"
 
 
 async def test_evaluate_expands_aggregates(cpp_paused):
@@ -289,3 +290,26 @@ async def test_continue_to_exit_captures_stdout(cpp_paused):
     assert result["state"] in ("exited", "terminated")
     output = result.get("program_output", "")
     assert "total=55" in output, repr(output[:200])
+
+
+# -- hex parity with the gdb_* backend ----------------------------------------
+
+
+async def test_integers_evaluate_in_hex_like_the_gdb_backend(cpp_paused):
+    """gdb_eval reports 0x11 for this; vsc_eval must not report 17."""
+    bridge, _stop = cpp_paused
+    result = await bridge.evaluate("g_connection_count")
+    assert result["value"].startswith("0x"), result
+    assert int(result["value"], 16) == 17
+
+
+async def test_hex_applies_to_frame_variables_too(cpp_paused):
+    bridge, _stop = cpp_paused
+    frames = (await bridge.backtrace(limit=1))["frames"]
+    frame = await bridge.frame(frames[0]["id"], expand_depth=0)
+    values = {
+        var["name"]: var["value"]
+        for scope in frame["scopes"]
+        for var in scope.get("variables", [])
+    }
+    assert values.get("limit", "").startswith("0x"), values

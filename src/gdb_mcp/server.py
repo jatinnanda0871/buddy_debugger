@@ -576,7 +576,12 @@ def build_server(
     debugger: Debugger | None = None, vscode: VSCodeDebugger | None = None
 ) -> Server:
     dbg = debugger or Debugger(gdb_path=os.environ.get("GDB_PATH", "gdb"))
-    vsc = vscode or VSCodeDebugger(workspace=os.environ.get("GDB_MCP_WORKSPACE"))
+    vsc = vscode or VSCodeDebugger(
+        workspace=os.environ.get("GDB_MCP_WORKSPACE"),
+        # Hex everywhere by default, matching the gdb_* backend. Set to 0
+        # to leave the editor's own Variables pane in decimal.
+        hex_output=os.environ.get("GDB_MCP_VSCODE_HEX", "1") != "0",
+    )
     exposed = select_tools(os.environ.get("GDB_MCP_TOOLS", "all"))
     server: Server = Server("gdb-mcp")
 
