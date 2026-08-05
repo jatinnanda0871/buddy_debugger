@@ -260,7 +260,9 @@ class GdbSession:
         if clear:
             self._program_output.clear()
             self._program_output_len = 0
-        return data.decode("utf-8", "replace")
+        # The tty turns every "\n" into "\r\n"; that is an artefact of how we
+        # capture the output, not something the program wrote.
+        return data.decode("utf-8", "replace").replace("\r\n", "\n")
 
     async def close(self, *, kill: bool = True, timeout: float = 5.0) -> None:
         """Shut down. When attached to a live process, `kill=False` detaches."""

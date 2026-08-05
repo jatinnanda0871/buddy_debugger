@@ -77,8 +77,9 @@ TOOLS: list[Tool] = [
     Tool(
         name="gdb_attach",
         description=(
-            "Attach to a running process by PID. This STOPS the target process "
-            "until you continue it. Requires ptrace permission."
+            "Attach to a running process by PID. Opens a session if none is "
+            "running. This STOPS the target process until you continue it, "
+            "and requires ptrace permission."
         ),
         inputSchema=_schema(
             {
@@ -90,7 +91,10 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="gdb_load_core",
-        description="Load a core dump for post-mortem analysis and return the crash backtrace.",
+        description=(
+            "Load a core dump for post-mortem analysis and return the crash "
+            "backtrace. Opens a session if none is running."
+        ),
         inputSchema=_schema(
             {
                 "binary": {"type": "string", "description": "Executable that produced the core."},

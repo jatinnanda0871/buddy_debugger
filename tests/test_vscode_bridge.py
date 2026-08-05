@@ -396,3 +396,45 @@ async def test_set_breakpoints_round_trips(bridge, debugger):
     await debugger.set_breakpoints([{"file": "/src/a.c", "line": 12}])
     listed = await debugger.list_breakpoints()
     assert listed["breakpoints"][0]["line"] == 12
+
+
+# -- Unix socket transport (Linux/macOS only) ---------------------------------
+
+
+@pytest.mark.skipif(
+    not hasattr(asyncio, "open_unix_connection"),
+    reason="Unix domain sockets are unavailable on this platform",
+)
+async def test_client_speaks_http_over_a_unix_socket(tmp_path, monkeypatch):
+    """The transport actually used on Linux: HTTP over a Unix domain socket."""
+    monkeypatch.setattr(vscode_bridge, "BRIDGE_DIR", str(tmp_path / "bridges"))
+    os.makedirs(vscode_bridge.BRIDGE_DIR, exist_ok=True)
+
+    fake = FakeBridge()
+    # Keep the path short: sun_path is capped near 108 bytes.
+    await fake.start_unix(str(tmp_path / "b.sock"))
+    try:
+        with open(
+            os.path.join(vscode_bridge.BRIDGE_DIR, f"{os.getpid()}.json"), "w"
+        ) as fh:
+            json.dump(fake.discovery_info(), fh)
+
+        info = discover()
+        assert info["transport"] == "unix"
+        assert "socketPath" in info and "port" not in info
+
+        debugger = VSCodeDebugger()
+        fake.add_session()
+        fake.set_stopped(reason="breakpoint", thread_id=3)
+        fake.dap_responses["stackTrace"] = {
+            "stackFrames": [{"id": 1, "name": "parse_header", "source": {}, "line": 22}]
+        }
+
+        status = await debugger.status()
+        assert status["state"] == "stopped"
+        assert status["frame"]["name"] == "parse_header"
+
+        bt = await debugger.backtrace()
+        assert bt["frames"][0]["name"] == "parse_header"
+    finally:
+        await fake.stop()
