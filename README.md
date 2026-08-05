@@ -302,20 +302,28 @@ about* the real component.
 GDB. It skips cleanly unless both `gdb` and `clang++` are on PATH, so it runs
 unattended anywhere the toolchain exists.
 
-`tests/live/test_live_bridge.py` drives a real VS Code debug session, so it
-needs an explicit opt-in as well as a discoverable bridge — otherwise merely
-having the editor open would let `pytest` hijack it:
+`tests/live/test_live_bridge.py` and `test_live_bridge_cpp.py` drive real VS
+Code debug sessions, so they need an explicit opt-in as well as a discoverable
+bridge — otherwise merely having the editor open would let `pytest` hijack it:
 
 ```bash
-GDB_MCP_LIVE_BRIDGE=1 pytest tests/live/test_live_bridge.py
+GDB_MCP_LIVE_BRIDGE=1 pytest tests/live/
 ```
+
+The cppdbg file is the one that matters for C++: it is the only place
+`vsc_exec`, `vsc_globals`, `vsc_memory` and `vsc_disassemble` do real work
+(debugpy can only prove they refuse cleanly). On Linux it builds and debugs
+locally; on Windows it builds in WSL and reaches it through cppdbg's
+`pipeTransport`, so gdb runs on Linux while VS Code stays on Windows. Point
+`GDB_MCP_CPP_PROGRAM` at a prebuilt binary to skip the build, and
+`GDB_MCP_WSL_DISTRO` to pick a distro.
 
 The contract tests exist because the fake is otherwise free to drift: they
 compare the extension's route table, discovery descriptor and event fields
 against both the fake and the client, statically, with no Node required.
 
-Typical counts: 167 passed / 16 skipped on Linux with gdb; 126 / 57 on Windows
-without it; 142 / 41 on Windows with the bridge opted in.
+Typical counts: 167 passed / 33 skipped on Linux with gdb; 126 / 74 on Windows
+without it; 159 / 41 on Windows with the bridge opted in and WSL available.
 
 Standalone GDB smoke test:
 

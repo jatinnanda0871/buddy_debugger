@@ -265,7 +265,11 @@ TOOLS: list[Tool] = [
             {
                 "pattern": {
                     "type": "string",
-                    "description": "Regex matched against the name. Strongly recommended.",
+                    "description": (
+                        "Unanchored regex matched against the name. Anchor it "
+                        "('^g_') or it also matches mid-name and drags in "
+                        "linked-library symbols. Strongly recommended."
+                    ),
                 },
                 "include_values": {
                     "type": "boolean",
@@ -537,7 +541,13 @@ VSCODE_TOOLS: list[Tool] = [
         ),
         inputSchema=_vsc(
             {
-                "pattern": {"type": "string", "description": "Regex matched against the name."},
+                "pattern": {
+                    "type": "string",
+                    "description": (
+                        "Unanchored regex matched against the name; anchor it "
+                        "('^g_') to exclude linked-library symbols."
+                    ),
+                },
                 "include_values": {"type": "boolean", "default": False},
             }
         ),

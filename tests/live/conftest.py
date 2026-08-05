@@ -13,19 +13,9 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from _helpers import CXX_CANDIDATES, find_cxx
 
 HERE = Path(__file__).parent
-
-#: clang only -- this project deliberately does not build with g++.
-CXX_CANDIDATES = ("clang++-14", "clang++-15", "clang++-16", "clang++")
-
-
-def find_cxx() -> str | None:
-    for name in CXX_CANDIDATES:
-        found = shutil.which(name)
-        if found:
-            return found
-    return None
 
 
 @pytest.fixture(scope="session")

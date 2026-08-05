@@ -651,11 +651,20 @@ class VSCodeDebugger:
         if frame_id is not None:
             args["frameId"] = frame_id
         result = await self._dap("evaluate", args)
-        return {
+        out: dict[str, Any] = {
             "expression": expression,
             "value": truncate(str((result or {}).get("result", "")), 8000),
             "type": (result or {}).get("type"),
         }
+        # cppdbg renders an aggregate as a bare summary -- a char[32] evaluates
+        # to "[32]" -- and puts the contents in children. Without expanding,
+        # asking for an array or struct returns nothing usable.
+        reference = (result or {}).get("variablesReference") or 0
+        if reference:
+            children = await self._variables(reference, depth=0, max_children=64)
+            if children:
+                out["children"] = children
+        return out
 
     async def _active_session(self) -> dict[str, Any] | None:
         raw = await self.client().status()
@@ -845,12 +854,35 @@ class VSCodeDebugger:
         )
         text = listing.get("output", "")
         names = _parse_info_variables(text)
+        # `info variables` matches anywhere in the name, so a search for "g_"
+        # also returns glibc's "__evoke_link_warning_sigreturn". Those carry
+        # source files too, so "has debug info" does not separate them -- but a
+        # name that *starts* with the pattern is almost always what was meant.
+        if pattern:
+            try:
+                prefix = re.compile(pattern.lstrip("^"))
+            except re.error:
+                prefix = None
+            if prefix is not None:
+                names.sort(  # stable, so ties keep GDB's ordering
+                    key=lambda entry: 0
+                    if prefix.match(entry.get("name", ""))
+                    else 1
+                )
+
         out: dict[str, Any] = {
             "pattern": pattern,
             "count": len(names),
             "globals": names,
             "listing": truncate(text, 8000),
         }
+        if pattern and len(names) > 25:
+            out["note"] = (
+                f"{len(names)} matches: `info variables` takes an *unanchored* "
+                f"regex, so {pattern!r} also matches mid-name (e.g. 'g_' hits "
+                "'__evoke_link_warning_sigreturn' inside glibc). Anchor it "
+                f"-- '^{pattern.lstrip('^')}' -- to see only your own globals."
+            )
         if include_values:
             for entry in names[:100]:
                 try:
