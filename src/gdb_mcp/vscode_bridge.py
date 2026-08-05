@@ -84,6 +84,9 @@ RESUME_COMMANDS = {
 
 STOP_EVENTS = ("stopped", "terminated", "exited")
 
+#: How long to let trailing `output` events land after the program exits.
+TRAILING_OUTPUT_GRACE = 0.35
+
 #: Adapter types whose REPL understands GDB's `-exec` escape. Everything else
 #: (cppvsdbg on Windows, debugpy, delve, ...) is DAP-only.
 GDB_BACKED_TYPES = {"cppdbg"}
@@ -322,7 +325,8 @@ class VSCodeDebugger:
             # A debug adapter that is shutting down rejects in-flight requests
             # with a bare "Canceled", which tells the caller nothing. This is
             # the common case of inspecting state after the program exited.
-            if "cancel" not in str(exc).lower():
+            lowered = str(exc).lower()
+            if "cancel" not in lowered and "no debugger" not in lowered:
                 raise
             with contextlib.suppress(BridgeError):
                 if await self._active_session() is None:
@@ -465,6 +469,13 @@ class VSCodeDebugger:
                     return event, cursor
             cursor = max(cursor, int(batch.get("lastSeq", cursor)))
 
+    async def _fold_in_output(self, out: dict[str, Any]) -> None:
+        """Attach pending program output; never let it cost us the report."""
+        with contextlib.suppress(BridgeError):
+            output = await self.program_output()
+            if output.get("output"):
+                out["program_output"] = output["output"]
+
     async def _describe_event(
         self, event: dict[str, Any] | None, *, running_hint: bool = False
     ) -> dict[str, Any]:
@@ -479,10 +490,18 @@ class VSCodeDebugger:
             return out
 
         kind = event.get("type")
-        if kind == "exited":
-            return {"state": "exited", "exit_code": event.get("exitCode")}
-        if kind == "terminated":
-            return {"state": "terminated", "note": "The debug session ended."}
+        if kind in ("exited", "terminated"):
+            out = {"state": kind}
+            if kind == "exited":
+                out["exit_code"] = event.get("exitCode")
+            else:
+                out["note"] = "The debug session ended."
+            # The adapter emits trailing `output` events just after the exit
+            # event, so draining immediately loses the program's last words --
+            # exactly what you want when it died.
+            await asyncio.sleep(TRAILING_OUTPUT_GRACE)
+            await self._fold_in_output(out)
+            return out
 
         out = {"state": "stopped", "reason": event.get("reason")}
         for key in ("description", "text", "hitBreakpointIds"):
@@ -492,10 +511,7 @@ class VSCodeDebugger:
         if thread_id is not None:
             out["thread_id"] = thread_id
             out.update(await self._frame_summary(thread_id))
-        with contextlib.suppress(BridgeError):
-            output = await self.program_output()
-            if output.get("output"):
-                out["program_output"] = output["output"]
+        await self._fold_in_output(out)
         return out
 
     # -- inspection ---------------------------------------------------------

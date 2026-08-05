@@ -784,10 +784,28 @@ class Debugger:
         except GdbError:
             # mode 5 (source + opcodes) needs GDB >= 7.11; retry plainly.
             result = await gdb.send(f"-data-disassemble -a {target} -- 0")
-        return {
-            "location": target,
-            "instructions": _as_list(result.payload.get("asm_insns"))[:count],
-        }
+
+        # With source interleaving GDB returns groups of instructions keyed by
+        # source line, not a flat list. Flatten it: otherwise the shape changes
+        # with `with_source`, and `count` would limit source lines rather than
+        # instructions.
+        instructions: list[dict[str, Any]] = []
+        for entry in _as_list(result.payload.get("asm_insns")):
+            if not isinstance(entry, dict):
+                continue
+            nested = entry.get("line_asm_insn")
+            if nested is None:
+                instructions.append(entry)
+                continue
+            for insn in _as_list(nested):
+                if not isinstance(insn, dict):
+                    continue
+                annotated = dict(insn)
+                annotated["source_line"] = entry.get("line")
+                annotated["source_file"] = entry.get("fullname") or entry.get("file")
+                instructions.append(annotated)
+
+        return {"location": target, "instructions": instructions[:count]}
 
     async def list_source(
         self,

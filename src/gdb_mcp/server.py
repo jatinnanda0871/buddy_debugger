@@ -278,7 +278,10 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="gdb_disassemble",
-        description="Disassemble around the current PC or a given location, interleaved with source.",
+        description=(
+            "Disassemble around the current PC or a given location. Returns a "
+            "flat list of instructions, each annotated with its source line."
+        ),
         inputSchema=_schema(
             {
                 "location": {"type": "string"},
