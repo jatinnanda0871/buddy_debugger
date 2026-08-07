@@ -265,7 +265,11 @@ TOOLS: list[Tool] = [
             {
                 "pattern": {
                     "type": "string",
-                    "description": "Regex matched against the name. Strongly recommended.",
+                    "description": (
+                        "Unanchored regex matched against the name. Anchor it "
+                        "('^g_') or it also matches mid-name and drags in "
+                        "linked-library symbols. Strongly recommended."
+                    ),
                 },
                 "include_values": {
                     "type": "boolean",
@@ -278,7 +282,10 @@ TOOLS: list[Tool] = [
     ),
     Tool(
         name="gdb_disassemble",
-        description="Disassemble around the current PC or a given location, interleaved with source.",
+        description=(
+            "Disassemble around the current PC or a given location. Returns a "
+            "flat list of instructions, each annotated with its source line."
+        ),
         inputSchema=_schema(
             {
                 "location": {"type": "string"},
@@ -534,7 +541,13 @@ VSCODE_TOOLS: list[Tool] = [
         ),
         inputSchema=_vsc(
             {
-                "pattern": {"type": "string", "description": "Regex matched against the name."},
+                "pattern": {
+                    "type": "string",
+                    "description": (
+                        "Unanchored regex matched against the name; anchor it "
+                        "('^g_') to exclude linked-library symbols."
+                    ),
+                },
                 "include_values": {"type": "boolean", "default": False},
             }
         ),
@@ -563,7 +576,12 @@ def build_server(
     debugger: Debugger | None = None, vscode: VSCodeDebugger | None = None
 ) -> Server:
     dbg = debugger or Debugger(gdb_path=os.environ.get("GDB_PATH", "gdb"))
-    vsc = vscode or VSCodeDebugger(workspace=os.environ.get("GDB_MCP_WORKSPACE"))
+    vsc = vscode or VSCodeDebugger(
+        workspace=os.environ.get("GDB_MCP_WORKSPACE"),
+        # Hex everywhere by default, matching the gdb_* backend. Set to 0
+        # to leave the editor's own Variables pane in decimal.
+        hex_output=os.environ.get("GDB_MCP_VSCODE_HEX", "1") != "0",
+    )
     exposed = select_tools(os.environ.get("GDB_MCP_TOOLS", "all"))
     server: Server = Server("gdb-mcp")
 

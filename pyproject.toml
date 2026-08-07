@@ -26,3 +26,6 @@ packages = ["src/gdb_mcp"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "live: drives a real gdb or a real VS Code bridge; skips when absent",
+]

@@ -190,9 +190,16 @@ accepts expressions (`&buf`, `pkt->payload`) rather than only raw addresses — 
 evaluates them to an address first. It renders the same rows, not the base64
 blob DAP actually carries.
 
-**Everything else is hex too.** Sessions start with `set output-radix 16`, so
-evaluated expressions, locals and register values all print in hex and agree
-with the memory dumps rather than mixing radices.
+**Everything else is hex too.** Both backends set `set output-radix 16`, so
+evaluated expressions, locals and register values print in hex and agree with
+the memory dumps rather than mixing radices — `gdb_eval` and `vsc_eval` return
+`0x11` for the same variable, not `0x11` and `17`.
+
+For `vsc_*` this is applied once per GDB-backed session, which also changes
+what **your** Variables pane and hover tooltips show, since it is your session.
+Set `GDB_MCP_VSCODE_HEX=0` to leave the editor in decimal; the `gdb_*` backend
+is unaffected either way. Adapters with no GDB underneath (debugpy, cppvsdbg)
+are never touched.
 
 ## Design notes
 
@@ -284,19 +291,46 @@ pip install -e '.[dev]'
 pytest -q
 ```
 
-98 tests, requiring neither `gdb` nor VS Code:
+Three layers, and only the first runs everywhere:
 
-- the MI parser runs against captured real gdb 12/13 output
-- the GDB session layer runs against `tests/fake_gdb.py`, a stub speaking enough
-  MI to reproduce the async-stop handshake, token interleaving, and the
-  never-stops-until-interrupted case
-- the bridge client runs against `tests/fake_bridge.py`, which serves the same
-  HTTP contract as the extension, covering stop-event waiting, stale-event
-  rejection, discovery of dead VS Code windows, and DAP variable expansion
+| Layer | Needs | What it proves |
+| --- | --- | --- |
+| Unit + protocol | nothing | MI parsing, event/stop logic, MCP schemas and `isError` |
+| Contract (`test_contract.py`) | nothing | `fake_bridge` still matches `extension.js` route-for-route |
+| Live (`tests/live/`) | real gdb / real VS Code | the parts that actually break |
 
-**This exercises the protocol layers, not GDB or VS Code themselves.** The
-extension in particular has never been executed — there was no Node toolchain
-available when it was written. Verify both on your box before trusting them.
+**The live tests are the ones that find bugs.** Every defect in this project so
+far — the `aschar 46` gutter, the rejected `-data-disassemble` form, mcp 2.0,
+CRLF from the pty, output lost on exit — passed the fakes and died on contact
+with the real thing. A fake only proves the client agrees with *my assumptions
+about* the real component.
+
+`tests/live/test_live_gdb.py` compiles a C++ target with clang and drives real
+GDB. It skips cleanly unless both `gdb` and `clang++` are on PATH, so it runs
+unattended anywhere the toolchain exists.
+
+`tests/live/test_live_bridge.py` and `test_live_bridge_cpp.py` drive real VS
+Code debug sessions, so they need an explicit opt-in as well as a discoverable
+bridge — otherwise merely having the editor open would let `pytest` hijack it:
+
+```bash
+GDB_MCP_LIVE_BRIDGE=1 pytest tests/live/
+```
+
+The cppdbg file is the one that matters for C++: it is the only place
+`vsc_exec`, `vsc_globals`, `vsc_memory` and `vsc_disassemble` do real work
+(debugpy can only prove they refuse cleanly). On Linux it builds and debugs
+locally; on Windows it builds in WSL and reaches it through cppdbg's
+`pipeTransport`, so gdb runs on Linux while VS Code stays on Windows. Point
+`GDB_MCP_CPP_PROGRAM` at a prebuilt binary to skip the build, and
+`GDB_MCP_WSL_DISTRO` to pick a distro.
+
+The contract tests exist because the fake is otherwise free to drift: they
+compare the extension's route table, discovery descriptor and event fields
+against both the fake and the client, statically, with no Node required.
+
+Typical counts: 171 passed / 35 skipped on Linux with gdb; 130 / 76 on Windows
+without it; 165 / 41 on Windows with the bridge opted in and WSL available.
 
 Standalone GDB smoke test:
 

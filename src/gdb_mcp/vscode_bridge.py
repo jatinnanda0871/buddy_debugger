@@ -84,6 +84,9 @@ RESUME_COMMANDS = {
 
 STOP_EVENTS = ("stopped", "terminated", "exited")
 
+#: How long to let trailing `output` events land after the program exits.
+TRAILING_OUTPUT_GRACE = 0.35
+
 #: Adapter types whose REPL understands GDB's `-exec` escape. Everything else
 #: (cppvsdbg on Windows, debugpy, delve, ...) is DAP-only.
 GDB_BACKED_TYPES = {"cppdbg"}
@@ -306,8 +309,16 @@ class BridgeClient:
 class VSCodeDebugger:
     """Tool surface over a live VS Code debug session."""
 
-    def __init__(self, workspace: str | None = None) -> None:
+    def __init__(
+        self, workspace: str | None = None, *, hex_output: bool = True
+    ) -> None:
         self.workspace = workspace
+        #: Match the gdb_* backend's `set output-radix 16`, so the same
+        #: variable does not read 0x11 through one backend and 17 through the
+        #: other. This is the user's own session, so it also changes what the
+        #: Variables pane and hover tooltips show -- hence the opt-out.
+        self.hex_output = hex_output
+        self._hex_configured: set[str] = set()
         self._client: BridgeClient | None = None
 
     def client(self, *, refresh: bool = False) -> BridgeClient:
@@ -322,7 +333,8 @@ class VSCodeDebugger:
             # A debug adapter that is shutting down rejects in-flight requests
             # with a bare "Canceled", which tells the caller nothing. This is
             # the common case of inspecting state after the program exited.
-            if "cancel" not in str(exc).lower():
+            lowered = str(exc).lower()
+            if "cancel" not in lowered and "no debugger" not in lowered:
                 raise
             with contextlib.suppress(BridgeError):
                 if await self._active_session() is None:
@@ -411,6 +423,9 @@ class VSCodeDebugger:
         if not wait_for_stop:
             return out
         event, _seq = await self._await_stop(before, timeout)
+        if event is not None and event.get("type") == "stopped":
+            with contextlib.suppress(BridgeError):
+                await self._ensure_hex_output()
         out["stop"] = await self._describe_event(event)
         return out
 
@@ -465,6 +480,13 @@ class VSCodeDebugger:
                     return event, cursor
             cursor = max(cursor, int(batch.get("lastSeq", cursor)))
 
+    async def _fold_in_output(self, out: dict[str, Any]) -> None:
+        """Attach pending program output; never let it cost us the report."""
+        with contextlib.suppress(BridgeError):
+            output = await self.program_output()
+            if output.get("output"):
+                out["program_output"] = output["output"]
+
     async def _describe_event(
         self, event: dict[str, Any] | None, *, running_hint: bool = False
     ) -> dict[str, Any]:
@@ -479,10 +501,18 @@ class VSCodeDebugger:
             return out
 
         kind = event.get("type")
-        if kind == "exited":
-            return {"state": "exited", "exit_code": event.get("exitCode")}
-        if kind == "terminated":
-            return {"state": "terminated", "note": "The debug session ended."}
+        if kind in ("exited", "terminated"):
+            out = {"state": kind}
+            if kind == "exited":
+                out["exit_code"] = event.get("exitCode")
+            else:
+                out["note"] = "The debug session ended."
+            # The adapter emits trailing `output` events just after the exit
+            # event, so draining immediately loses the program's last words --
+            # exactly what you want when it died.
+            await asyncio.sleep(TRAILING_OUTPUT_GRACE)
+            await self._fold_in_output(out)
+            return out
 
         out = {"state": "stopped", "reason": event.get("reason")}
         for key in ("description", "text", "hitBreakpointIds"):
@@ -492,10 +522,7 @@ class VSCodeDebugger:
         if thread_id is not None:
             out["thread_id"] = thread_id
             out.update(await self._frame_summary(thread_id))
-        with contextlib.suppress(BridgeError):
-            output = await self.program_output()
-            if output.get("output"):
-                out["program_output"] = output["output"]
+        await self._fold_in_output(out)
         return out
 
     # -- inspection ---------------------------------------------------------
@@ -578,6 +605,7 @@ class VSCodeDebugger:
         self, frame_id: int, *, expand_depth: int = 1, max_children: int = 60
     ) -> dict[str, Any]:
         """Scopes and variables for a frame, with children expanded one level."""
+        await self._ensure_hex_output()
         scopes_result = await self._dap("scopes", {"frameId": int(frame_id)})
         out: dict[str, Any] = {"frame_id": frame_id, "scopes": []}
         for scope in (scopes_result or {}).get("scopes", []):
@@ -629,17 +657,27 @@ class VSCodeDebugger:
         frame_id: int | None = None,
         context: str = "watch",
     ) -> dict[str, Any]:
+        await self._ensure_hex_output()
         if frame_id is None:
             frame_id = await self._top_frame_id()
         args: dict[str, Any] = {"expression": expression, "context": context}
         if frame_id is not None:
             args["frameId"] = frame_id
         result = await self._dap("evaluate", args)
-        return {
+        out: dict[str, Any] = {
             "expression": expression,
             "value": truncate(str((result or {}).get("result", "")), 8000),
             "type": (result or {}).get("type"),
         }
+        # cppdbg renders an aggregate as a bare summary -- a char[32] evaluates
+        # to "[32]" -- and puts the contents in children. Without expanding,
+        # asking for an array or struct returns nothing usable.
+        reference = (result or {}).get("variablesReference") or 0
+        if reference:
+            children = await self._variables(reference, depth=0, max_children=64)
+            if children:
+                out["children"] = children
+        return out
 
     async def _active_session(self) -> dict[str, Any] | None:
         raw = await self.client().status()
@@ -670,6 +708,28 @@ class VSCodeDebugger:
             "work with any adapter. For GDB features on Windows, set the "
             "launch.json type to 'cppdbg' with a MinGW or WSL gdb."
         )
+
+    async def _ensure_hex_output(self) -> None:
+        """Put a GDB-backed session into hex, once, before reading values.
+
+        Applied lazily rather than on connect because scenario one is the user
+        pressing F5 themselves -- there is no launch call to hook.
+        """
+        if not self.hex_output:
+            return
+        session = await self._active_session()
+        if session is None:
+            return
+        session_id = session.get("id")
+        if not session_id or session_id in self._hex_configured:
+            return
+        # Record first: a non-GDB adapter can never be configured, and a
+        # failure should not be retried on every single evaluation.
+        self._hex_configured.add(session_id)
+        if session.get("type") not in GDB_BACKED_TYPES:
+            return
+        with contextlib.suppress(BridgeError):
+            await self.exec_gdb("set output-radix 16", tool_name="vsc_eval")
 
     async def exec_gdb(
         self, command: str, *, tool_name: str = "vsc_exec"
@@ -829,12 +889,35 @@ class VSCodeDebugger:
         )
         text = listing.get("output", "")
         names = _parse_info_variables(text)
+        # `info variables` matches anywhere in the name, so a search for "g_"
+        # also returns glibc's "__evoke_link_warning_sigreturn". Those carry
+        # source files too, so "has debug info" does not separate them -- but a
+        # name that *starts* with the pattern is almost always what was meant.
+        if pattern:
+            try:
+                prefix = re.compile(pattern.lstrip("^"))
+            except re.error:
+                prefix = None
+            if prefix is not None:
+                names.sort(  # stable, so ties keep GDB's ordering
+                    key=lambda entry: 0
+                    if prefix.match(entry.get("name", ""))
+                    else 1
+                )
+
         out: dict[str, Any] = {
             "pattern": pattern,
             "count": len(names),
             "globals": names,
             "listing": truncate(text, 8000),
         }
+        if pattern and len(names) > 25:
+            out["note"] = (
+                f"{len(names)} matches: `info variables` takes an *unanchored* "
+                f"regex, so {pattern!r} also matches mid-name (e.g. 'g_' hits "
+                "'__evoke_link_warning_sigreturn' inside glibc). Anchor it "
+                f"-- '^{pattern.lstrip('^')}' -- to see only your own globals."
+            )
         if include_values:
             for entry in names[:100]:
                 try:
