@@ -10,11 +10,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
+import traceback
 from typing import Any
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
-from mcp.types import CallToolResult, TextContent, Tool
+from mcp.types import TextContent, Tool
 
 from .session import GdbError, GdbStartupError
 from .tools import Debugger
@@ -590,36 +592,35 @@ def build_server(
         return exposed
 
     @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
+    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         args = dict(arguments or {})
-        failed = True
         try:
             if name.startswith("vsc_"):
                 result = await _dispatch_vscode(vsc, name, args)
             else:
                 session = args.pop("session", "default")
                 result = await _dispatch(dbg, name, session, args)
-            failed = False
         except BridgeError as exc:
-            result = {"error": str(exc), "tool": name}
+            error = {"error": str(exc), "tool": name}
         except (GdbError, GdbStartupError, ValueError) as exc:
-            result = {"error": str(exc), "tool": name}
+            error = {"error": str(exc), "tool": name}
         except TypeError as exc:
-            result = {"error": f"bad arguments for {name}: {exc}", "tool": name}
+            error = {"error": f"bad arguments for {name}: {exc}", "tool": name}
         except asyncio.TimeoutError as exc:
-            result = {
+            error = {
                 "error": f"timed out: {exc}",
                 "tool": name,
                 "hint": "The program may still be running; try vsc_pause or gdb_interrupt.",
             }
-        # isError must be set, or a client that checks it reads a failed
-        # debugger call -- no gdb, no bridge, bad breakpoint -- as success.
-        return CallToolResult(
-            content=[
-                TextContent(type="text", text=json.dumps(result, indent=2, default=str))
-            ],
-            isError=failed,
-        )
+        else:
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+        # Raise instead of building a CallToolResult ourselves: the mcp SDK's
+        # own except-handler turns this into isError=True. Constructing
+        # CallToolResult directly only works on mcp>=1.11 -- older SDKs
+        # (e.g. 1.10.x) treat a returned CallToolResult as a plain iterable
+        # of its pydantic fields instead of a result object, corrupting the
+        # response. Raising works identically across SDK versions.
+        raise RuntimeError(json.dumps(error, indent=2, default=str))
 
     return server
 
@@ -741,11 +742,47 @@ async def amain() -> None:
         await dbg.shutdown_all()
 
 
+def _leaf_exceptions(exc: BaseException) -> list[BaseException]:
+    """Flatten a (Base)ExceptionGroup down to its non-group leaves.
+
+    anyio's task groups wrap concurrent failures -- e.g. a broken stdio pipe
+    racing a Ctrl-C -- in an ExceptionGroup/BaseExceptionGroup rather than
+    raising a single exception, so a plain `except KeyboardInterrupt` can
+    silently miss one that arrives bundled with something else.
+    """
+    exceptions = getattr(exc, "exceptions", None)
+    if exceptions is None:
+        return [exc]
+    leaves: list[BaseException] = []
+    for sub in exceptions:
+        leaves.extend(_leaf_exceptions(sub))
+    return leaves
+
+
+def _is_clean_shutdown(exc: BaseException) -> bool:
+    """True if every leaf of `exc` is just a Ctrl-C -- nothing worth logging."""
+    return all(isinstance(leaf, KeyboardInterrupt) for leaf in _leaf_exceptions(exc))
+
+
 def main() -> None:
     try:
         asyncio.run(amain())
-    except KeyboardInterrupt:
-        pass
+    except BaseException as exc:
+        if isinstance(exc, SystemExit):
+            raise
+        if _is_clean_shutdown(exc):
+            return
+        # The client tore down the stdio pipe (killed/reconnected the
+        # subprocess, usually after its own call timeout fired) while a
+        # tool call was still in flight; the delayed response write then
+        # fails as a broken pipe (anyio.BrokenResourceError and friends,
+        # often wrapped in an (Base)ExceptionGroup by anyio's task groups).
+        # The transport is dead either way, so there's nothing left to do
+        # but log clearly instead of an unhandled traceback and exit --
+        # the client is expected to relaunch the server for its next call.
+        print("gdb-mcp: transport closed while a tool call was still running:", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
