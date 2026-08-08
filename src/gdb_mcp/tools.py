@@ -7,7 +7,9 @@ into an error payload.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import itertools
 import os
 from typing import Any
 
@@ -143,7 +145,12 @@ def render_rows(rows: list[dict[str, Any]]) -> str:
 def source_context(
     fullname: str | None, line: Any, *, before: int = 6, after: int = 6
 ) -> list[dict[str, Any]] | None:
-    """Read source lines around `line`, if the file is readable locally."""
+    """Read source lines around `line`, if the file is readable locally.
+
+    This is blocking file I/O -- call it via `asyncio.to_thread` from async
+    code, never directly, so a slow (e.g. network-mounted) source tree can't
+    stall the whole event loop for every other concurrent session.
+    """
     if not fullname or line in (None, ""):
         return None
     lineno = to_int(line)
@@ -151,24 +158,27 @@ def source_context(
         return None
     if not os.path.isfile(fullname):
         return None
+    lo = max(1, lineno - before)
+    hi = lineno + after
     try:
         with open(fullname, "r", encoding="utf-8", errors="replace") as fh:
-            lines = fh.readlines()
+            # Only reads up to `hi` lines rather than the whole file -- the
+            # difference matters when `fullname` is huge (a single generated
+            # or vendored source file) and the requested line is near the top.
+            window = list(itertools.islice(fh, lo - 1, hi))
     except OSError:
         return None
-    lo = max(1, lineno - before)
-    hi = min(len(lines), lineno + after)
     return [
         {
-            "line": n,
-            "current": n == lineno,
-            "text": lines[n - 1].rstrip("\n"),
+            "line": lo + i,
+            "current": lo + i == lineno,
+            "text": text.rstrip("\n"),
         }
-        for n in range(lo, hi + 1)
+        for i, text in enumerate(window)
     ]
 
 
-def describe_stop(stop: StopEvent | None, *, running: bool) -> dict[str, Any]:
+async def describe_stop(stop: StopEvent | None, *, running: bool) -> dict[str, Any]:
     """Compact 'where am I' summary, so the model needs one call, not four."""
     if stop is None:
         return {
@@ -211,7 +221,9 @@ def describe_stop(stop: StopEvent | None, *, running: bool) -> dict[str, Any]:
         args = frame.get("args")
         if args:
             out["frame"]["args"] = args
-        ctx = source_context(frame.get("fullname"), frame.get("line"))
+        ctx = await asyncio.to_thread(
+            source_context, frame.get("fullname"), frame.get("line")
+        )
         if ctx:
             out["source"] = ctx
     return out
@@ -225,6 +237,7 @@ class Debugger:
     def __init__(self, *, gdb_path: str = "gdb") -> None:
         self.gdb_path = gdb_path
         self.sessions: dict[str, GdbSession] = {}
+        self._session_locks: dict[str, asyncio.Lock] = {}
 
     # -- session plumbing ---------------------------------------------------
 
@@ -236,6 +249,14 @@ class Debugger:
             )
         return session
 
+    def _lock_for(self, name: str) -> asyncio.Lock:
+        """One lock per session name, so starting/replacing session 'a' never
+        blocks concurrent work on session 'b'."""
+        lock = self._session_locks.get(name)
+        if lock is None:
+            lock = self._session_locks[name] = asyncio.Lock()
+        return lock
+
     async def _ensure_session(self, name: str) -> GdbSession:
         """Get the session, starting one if it does not exist yet.
 
@@ -246,8 +267,14 @@ class Debugger:
         existing = self.sessions.get(name)
         if existing is not None and existing.alive:
             return existing
-        self.sessions.pop(name, None)
-        await self.start(session=name)
+        async with self._lock_for(name):
+            # Re-check: a concurrent gdb_start/gdb_attach for this same name
+            # may have already won the race while we waited for the lock.
+            existing = self.sessions.get(name)
+            if existing is not None and existing.alive:
+                return existing
+            self.sessions.pop(name, None)
+            await self._start_locked(session=name)
         return self.get(name)
 
     async def start(
@@ -260,6 +287,34 @@ class Debugger:
         gdb_path: str | None = None,
         use_init_file: bool = False,
     ) -> dict[str, Any]:
+        async with self._lock_for(session):
+            return await self._start_locked(
+                session=session,
+                binary=binary,
+                args=args,
+                cwd=cwd,
+                gdb_path=gdb_path,
+                use_init_file=use_init_file,
+            )
+
+    async def _start_locked(
+        self,
+        *,
+        session: str,
+        binary: str | None = None,
+        args: list[str] | str | None = None,
+        cwd: str | None = None,
+        gdb_path: str | None = None,
+        use_init_file: bool = False,
+    ) -> dict[str, Any]:
+        """The body of `start`, run while holding `_lock_for(session)`.
+
+        Without the lock, two concurrent gdb_start calls for the same session
+        name can both pass the "not already running" check before either
+        finishes spawning gdb (spawning is an `await`, so it yields control
+        back to the loop) -- the second registration then silently overwrites
+        the first, leaking an orphaned, untracked gdb subprocess.
+        """
         existing = self.sessions.get(session)
         if existing is not None and existing.alive:
             raise ValueError(
@@ -319,7 +374,10 @@ class Debugger:
         gdb.attached_pid = int(pid)
         # Attaching stops the process; report where it landed.
         stop = gdb.last_stop or await gdb.wait_for_stop(timeout=5)
-        out = {"attached_pid": int(pid), "stop": describe_stop(stop, running=gdb.running)}
+        out = {
+            "attached_pid": int(pid),
+            "stop": await describe_stop(stop, running=gdb.running),
+        }
         if stop is None:
             out["stop"] = await self.status(session=session)
         return out
@@ -379,7 +437,9 @@ class Debugger:
             frame = (await gdb.send("-stack-info-frame")).payload.get("frame")
             if isinstance(frame, dict):
                 out["frame"] = frame
-                ctx = source_context(frame.get("fullname"), frame.get("line"))
+                ctx = await asyncio.to_thread(
+                    source_context, frame.get("fullname"), frame.get("line")
+                )
                 if ctx:
                     out["source"] = ctx
         if gdb.last_stop is not None:
@@ -410,14 +470,14 @@ class Debugger:
                 raise
             # --start needs a `main`; retry plainly for stripped/odd binaries.
             _result, stop = await gdb.execute("-exec-run", stop_timeout=timeout)
-        return self._exec_result(gdb, stop)
+        return await self._exec_result(gdb, stop)
 
     async def cont(
         self, *, session: str = "default", timeout: float = DEFAULT_STOP_TIMEOUT
     ) -> dict[str, Any]:
         gdb = self.get(session)
         _result, stop = await gdb.execute("-exec-continue", stop_timeout=timeout)
-        return self._exec_result(gdb, stop)
+        return await self._exec_result(gdb, stop)
 
     async def step(
         self,
@@ -438,15 +498,15 @@ class Debugger:
             _result, stop = await gdb.execute(command, stop_timeout=timeout)
             if stop is None or stop.exited:
                 break
-        return self._exec_result(gdb, stop)
+        return await self._exec_result(gdb, stop)
 
     async def interrupt(self, *, session: str = "default") -> dict[str, Any]:
         gdb = self.get(session)
         stop = await gdb.interrupt()
-        return self._exec_result(gdb, stop)
+        return await self._exec_result(gdb, stop)
 
-    def _exec_result(self, gdb: GdbSession, stop: StopEvent | None) -> dict[str, Any]:
-        out = describe_stop(stop, running=gdb.running)
+    async def _exec_result(self, gdb: GdbSession, stop: StopEvent | None) -> dict[str, Any]:
+        out = await describe_stop(stop, running=gdb.running)
         output = gdb.read_program_output()
         if output:
             out["program_output"] = truncate(output, 4000)
@@ -545,7 +605,9 @@ class Debugger:
             "variables": _as_list(variables.payload.get("variables")),
         }
         if isinstance(frame, dict):
-            ctx = source_context(frame.get("fullname"), frame.get("line"))
+            ctx = await asyncio.to_thread(
+                source_context, frame.get("fullname"), frame.get("line")
+            )
             if ctx:
                 out["source"] = ctx
         return out
@@ -801,7 +863,8 @@ class Debugger:
             output = await gdb.console(f"list {location}")
         else:
             frame = (await gdb.send("-stack-info-frame")).payload.get("frame", {})
-            ctx = source_context(
+            ctx = await asyncio.to_thread(
+                source_context,
                 frame.get("fullname"),
                 frame.get("line"),
                 before=lines // 2,
