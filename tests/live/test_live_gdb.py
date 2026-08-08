@@ -273,6 +273,34 @@ async def test_draining_output_twice_explains_the_empty_result(
     assert "delivered" in drained["note"]
 
 
+# -- reverse debugging ---------------------------------------------------------
+
+
+async def test_reverse_without_recording_gives_a_clear_error(stopped_in_parse_header):
+    """The fake proves the wrapping logic; this proves real gdb actually
+    raises on a bare `--reverse` and that the wrapped message still matches."""
+    from gdb_mcp.session import GdbError
+
+    with pytest.raises(GdbError, match="gdb_record"):
+        await stopped_in_parse_header.reverse(kind="step")
+
+
+async def test_reverse_step_undoes_forward_steps(stopped_in_parse_header):
+    """Step forward through parse_header's loop, then step the same distance
+    backward -- a real process-record round trip, not just protocol shape."""
+    debugger = stopped_in_parse_header
+    start_line = (await debugger.status())["frame"]["line"]
+
+    await debugger.record(action="start")
+    forward = await debugger.step(kind="next", count=3, timeout=30)
+    assert forward["state"] == "stopped"
+    assert forward["frame"]["line"] != start_line
+
+    back = await debugger.reverse(kind="step", count=3, timeout=30)
+    assert back["state"] == "stopped"
+    assert back["frame"]["line"] == start_line
+
+
 # -- crashes and core dumps ---------------------------------------------------
 
 

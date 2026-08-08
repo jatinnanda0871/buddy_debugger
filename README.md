@@ -52,7 +52,7 @@ run **GDB MCP Bridge: Show Status** to confirm. See
 [vscode-extension/README.md](vscode-extension/README.md) for the HTTP contract
 and security model.
 
-`GDB_MCP_TOOLS` trims the 45-tool surface if that's too much for your model to
+`GDB_MCP_TOOLS` trims the 47-tool surface if that's too much for your model to
 choose between: `vscode` exposes only `vsc_*`, `gdb` only `gdb_*`, `all`
 (default) exposes both.
 
@@ -143,6 +143,7 @@ vsc_terminate
 | `gdb_attach` | Attach to a live PID (**stops that process**) |
 | `gdb_load_core` | Post-mortem on a core dump; returns the crash backtrace |
 | `gdb_run` / `gdb_continue` / `gdb_step` / `gdb_interrupt` | Execution control |
+| `gdb_record` / `gdb_reverse` | Record execution, then run it backward |
 | `gdb_break` / `gdb_watch` / `gdb_breakpoints` / `gdb_delete_breakpoint` | Breakpoints |
 | `gdb_enable_breakpoint` | Enable/disable a breakpoint without deleting it |
 | `gdb_backtrace` / `gdb_frame` / `gdb_eval` | Stack, locals + args, expressions |
@@ -252,6 +253,14 @@ The defaults assume you may point this at something you care about.
 - **`gdb_stop` detaches, it doesn't kill.** Pass `kill=true` deliberately.
 - **`gdb_attach` freezes the target** until you continue it. On a production
   service that is downtime — an agent should be told so in its system prompt.
+- **`gdb_record` has real overhead.** Process record-and-replay slows
+  execution and its memory cost grows with how long it runs — start it only
+  when you actually need `gdb_reverse`, and stop it when you're done. It is
+  `gdb_*`-only: there is no `vsc_record`, since DAP's reverse-debugging
+  requests aren't reliably supported by the adapters this project targets. A
+  GDB-backed `vsc_*` session can still reach the same underlying commands via
+  `vsc_exec("record")` / `vsc_exec("reverse-step")`, just without the
+  structured stop result.
 - **`gdb_raw` and `vsc_exec` are unrestricted.** Both reach `shell`, `set var`,
   `call`. Drop them from the list if you want a read-only posture.
 - **The bridge socket is `0600`** in your `$TMPDIR`, with a fresh 32-byte token

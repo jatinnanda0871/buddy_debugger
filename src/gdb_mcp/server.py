@@ -155,6 +155,49 @@ TOOLS: list[Tool] = [
         inputSchema=_schema({}),
     ),
     Tool(
+        name="gdb_record",
+        description=(
+            "Start or stop recording the inferior's execution history "
+            "(GDB's process record-and-replay), required before gdb_reverse "
+            "will work. Recording has real overhead, so turn it on only when "
+            "you actually need to step backward."
+        ),
+        inputSchema=_schema(
+            {
+                "action": {"type": "string", "enum": ["start", "stop"], "default": "start"},
+                "method": {
+                    "type": "string",
+                    "description": "Recording method, e.g. 'full' (default) or 'btrace'. Omit for GDB's default.",
+                },
+            }
+        ),
+    ),
+    Tool(
+        name="gdb_reverse",
+        description=(
+            "Run the program BACKWARD instead of forward -- undo execution to "
+            "see how a bad value got there, rather than reproducing the bug "
+            "again from the start. Requires gdb_record(action='start') first. "
+            "kind: continue (backward to the previous stop), step (into, "
+            "backward), next (over, backward), finish (backward out of the "
+            "current frame, landing just before it was called). Same result "
+            "shape as gdb_continue/gdb_step, including the locals diff -- "
+            "'new' is where execution is heading (backward), 'old' is where "
+            "it just was."
+        ),
+        inputSchema=_schema(
+            {
+                "kind": {
+                    "type": "string",
+                    "enum": ["continue", "step", "next", "finish"],
+                    "default": "continue",
+                },
+                "count": {"type": "integer", "default": 1, "description": "Repeat this many times."},
+                "timeout": {"type": "number", "default": 30},
+            }
+        ),
+    ),
+    Tool(
         name="gdb_break",
         description="Set a breakpoint at a function, file:line, or *address.",
         inputSchema=_schema(
@@ -585,7 +628,7 @@ ALL_TOOLS = VSCODE_TOOLS + TOOLS
 def select_tools(which: str = "all") -> list[Tool]:
     """Trim the exposed surface.
 
-    45 tools is a lot for a model to choose between. If you only ever debug
+    47 tools is a lot for a model to choose between. If you only ever debug
     through VS Code, set GDB_MCP_TOOLS=vscode and the standalone GDB tools
     disappear (and vice versa for headless core-dump work).
     """
@@ -717,6 +760,10 @@ async def _dispatch(
             return await dbg.step(session=session, **args)
         case "gdb_interrupt":
             return await dbg.interrupt(session=session)
+        case "gdb_record":
+            return await dbg.record(session=session, **args)
+        case "gdb_reverse":
+            return await dbg.reverse(session=session, **args)
         case "gdb_break":
             return await dbg.set_breakpoint(session=session, **args)
         case "gdb_watch":

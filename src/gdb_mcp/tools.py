@@ -29,6 +29,22 @@ STEP_KINDS = {
     "until": "-exec-until",
 }
 
+#: `record` has no MI form (confirmed against gdb 15.1's `-list-features`);
+#: it goes through the console route, like core-file loading.
+RECORD_ACTIONS = {
+    "start": "record",
+    "stop": "record stop",
+}
+
+#: GDB's own `--reverse` flag on the exec commands, valid only while a
+#: process record (gdb_record) is active.
+REVERSE_KINDS = {
+    "continue": "-exec-continue --reverse",
+    "step": "-exec-step --reverse",
+    "next": "-exec-next --reverse",
+    "finish": "-exec-finish --reverse",
+}
+
 
 def truncate(text: str, limit: int = MAX_TEXT) -> str:
     if len(text) <= limit:
@@ -503,6 +519,65 @@ class Debugger:
     async def interrupt(self, *, session: str = "default") -> dict[str, Any]:
         gdb = self.get(session)
         stop = await gdb.interrupt()
+        return await self._exec_result(gdb, stop)
+
+    async def record(
+        self,
+        *,
+        session: str = "default",
+        action: str = "start",
+        method: str | None = None,
+    ) -> dict[str, Any]:
+        """Start or stop recording execution history, needed for gdb_reverse.
+
+        Recording has real overhead and a memory cost that grows with how long
+        it runs, so it is opt-in rather than always-on.
+
+        No MI command exists for this -- like core-file loading, `record` is
+        CLI-only, so this goes through the console route.
+        """
+        gdb = self.get(session)
+        if action not in RECORD_ACTIONS:
+            raise ValueError(f"action must be one of: {', '.join(sorted(RECORD_ACTIONS))}")
+        command = RECORD_ACTIONS[action]
+        if action == "start" and method:
+            command += f" {method}"
+        await gdb.console(command, timeout=30)
+        return {"recording": action == "start", "method": method if action == "start" else None}
+
+    async def reverse(
+        self,
+        kind: str = "continue",
+        *,
+        session: str = "default",
+        count: int = 1,
+        timeout: float = DEFAULT_STOP_TIMEOUT,
+    ) -> dict[str, Any]:
+        """Run the program backward. Requires gdb_record(action="start") first.
+
+        Reuses the same stop machinery as gdb_step/gdb_continue -- frame,
+        source context, and the locals diff all just work, except now "new"
+        is where execution is heading (backward) and "old" is where it just
+        was.
+        """
+        gdb = self.get(session)
+        if kind not in REVERSE_KINDS:
+            raise ValueError(
+                f"Unknown reverse kind {kind!r}. Use one of: {', '.join(sorted(REVERSE_KINDS))}"
+            )
+        command = REVERSE_KINDS[kind]
+        stop: StopEvent | None = None
+        for _ in range(max(1, int(count))):
+            try:
+                _result, stop = await gdb.execute(command, stop_timeout=timeout)
+            except GdbError as exc:
+                raise GdbError(
+                    f"{exc} -- reverse execution needs a process record. Call "
+                    "gdb_record(action='start') first.",
+                    command,
+                ) from exc
+            if stop is None or stop.exited:
+                break
         return await self._exec_result(gdb, stop)
 
     async def _exec_result(self, gdb: GdbSession, stop: StopEvent | None) -> dict[str, Any]:

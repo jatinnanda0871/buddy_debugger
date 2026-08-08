@@ -45,9 +45,16 @@ STOP_AT_MAIN = (
 #: actually changes across stops -- needed to exercise locals-diffing.
 _step_count = 0
 
+#: True once `record` has run and until `record stop` does -- reverse
+#: execution commands only succeed while this is set, same as real gdb
+#: without an active recording. `record` has no MI form (confirmed against
+#: real gdb 15.1), so it arrives here as a console command, same as any
+#: other CLI-only command.
+_recording = False
+
 
 def main() -> int:
-    global _step_count
+    global _step_count, _recording
     if "--interpreter=mi3" not in sys.argv and "--interpreter=mi2" not in sys.argv:
         sys.stderr.write("fake_gdb: expected --interpreter=mi2|mi3\n")
         return 1
@@ -89,6 +96,36 @@ def main() -> int:
             emit('*running,thread-id="all"')
             prompt()
             delayed_stop(0.05, STOP_AT_MAIN)
+            continue
+
+        if command.startswith('-interpreter-exec console "record stop'):
+            _recording = False
+            emit(f"{token}^done")
+            prompt()
+            continue
+
+        if command.startswith('-interpreter-exec console "record'):
+            _recording = True
+            emit(f"{token}^done")
+            prompt()
+            continue
+
+        if "--reverse" in command:
+            if not _recording:
+                emit(
+                    f'{token}^error,msg="Target does not support this command '
+                    'without a process record."'
+                )
+                prompt()
+                continue
+            emit(f"{token}^running")
+            prompt()
+            delayed_stop(
+                0.02,
+                '*stopped,reason="end-stepping-range",'
+                'frame={addr="0x401130",func="main",file="t.c",line="4"},'
+                'thread-id="1"',
+            )
             continue
 
         if command.startswith("-exec-continue"):

@@ -99,6 +99,16 @@ async def test_enable_breakpoint_tool_is_wired(tmp_path, monkeypatch):
         assert "No active GDB session" in payload(result)["error"]
 
 
+@pytest.mark.parametrize(
+    "tool,args", [("gdb_record", {}), ("gdb_reverse", {"kind": "continue"})]
+)
+async def test_reverse_debugging_tools_are_wired(tool, args, tmp_path, monkeypatch):
+    async with connected(tmp_path, monkeypatch) as client:
+        result = await client.call_tool(tool, args)
+        assert result.isError is True
+        assert "No active GDB session" in payload(result)["error"]
+
+
 async def test_unknown_tool_sets_is_error(tmp_path, monkeypatch):
     async with connected(tmp_path, monkeypatch) as client:
         result = await client.call_tool("gdb_not_a_tool", {})
