@@ -1,0 +1,38 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit-and-contract:
+    # No gdb needed here -- these are the tests that run everywhere, on every
+    # platform this project supports.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e ".[dev]"
+      - run: pytest -q --ignore=tests/live
+
+  live-gdb:
+    # tests/live/test_live_gdb.py compiles a C++ target and drives real gdb;
+    # it skips cleanly if either tool is missing, so this just proves the
+    # toolchain we install is enough for it to actually run.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y gdb clang
+      - run: pip install -e ".[dev]"
+      - run: pytest -q tests/live/test_live_gdb.py
