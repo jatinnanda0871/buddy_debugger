@@ -137,6 +137,12 @@ class GdbSession:
         self.attached_pid: int | None = None
         self.core_file: str | None = None
 
+        # Locals snapshot from the innermost frame at the previous stop, used
+        # to diff against the current one. Reset whenever the scope changes
+        # (a different function) or the inferior exits.
+        self.locals_baseline: dict[str, Any] | None = None
+        self.locals_baseline_scope: str | None = None
+
     # -- lifecycle ----------------------------------------------------------
 
     @property

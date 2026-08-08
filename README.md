@@ -222,6 +222,15 @@ ever fabricates a stop.
 breakpoint number, frame, *and* the surrounding source lines, so the model needs
 one call rather than four to know where it is.
 
+**Locals are diffed, not re-sent.** `gdb_run` / `gdb_continue` / `gdb_step` and
+their `vsc_*` equivalents fold the current frame's locals into the stop result.
+The first stop in a scope returns all of them, under `variables`; every
+subsequent stop in the *same* scope (same function) instead returns
+`changed_variables` — only the ones whose value moved, plus an
+`unchanged_count` — so stepping through a loop doesn't re-send every unchanged
+local on every iteration. A scope change (a different function) resets the
+baseline and returns the full list again.
+
 **The inferior gets its own pty.** On a native Linux target the debugged program
 shares GDB's terminal, so its `printf` output lands in the middle of the MI
 stream and corrupts parsing. The session allocates a pty, points
