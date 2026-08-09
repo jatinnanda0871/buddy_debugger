@@ -5,15 +5,14 @@ This is a thin adapter: it declares the tool schemas and routes calls to
 (the live VS Code session).
 
 The surface is 7 dispatcher tools (4 `gdb_*`, 3 `vsc_*`), not one tool per
-operation. Each takes an `operation` enum plus that operation's own fields;
+operation: each takes an `operation` enum plus that operation's own fields.
 `allOf`/`if`/`then` branches on `operation` still enforce per-operation
-`required` fields the same way separate tools would (verified against the
-installed `jsonschema` version this SDK validates with -- see
-`_dispatch_tool`). Grouped by what the operations *do*, not forced together
-just to hit a number: session lifecycle, execution control, breakpoint
-management, and read-only inspection are different enough in shape and intent
-that cramming them into fewer, less cohesive tools would only make both the
-code and the model's job harder.
+`required` fields the same way separate tools would -- see `_dispatch_tool`.
+Grouped by what the operations *do* (session lifecycle, execution control,
+breakpoint management, read-only inspection), not forced together just to
+hit a lower number: those four are different enough in shape and intent that
+cramming them into fewer tools would make both the code and the model's job
+harder, not easier.
 """
 
 from __future__ import annotations
@@ -32,6 +31,15 @@ from mcp.types import TextContent, Tool
 from .session import GdbError, GdbStartupError
 from .tools import Debugger
 from .vscode_bridge import BridgeError, VSCodeDebugger
+
+# -- configuration (environment variables this server reads) ------------------
+
+ENV_GDB_PATH = "GDB_PATH"  #: gdb binary path/name. Default: "gdb" (must be on PATH).
+ENV_WORKSPACE = "GDB_MCP_WORKSPACE"  #: Prefer the vsc bridge whose workspace matches this path. Default: none.
+ENV_VSCODE_HEX = "GDB_MCP_VSCODE_HEX"  #: "0" leaves vsc_* sessions in decimal. Default: hex, matching gdb_*.
+ENV_TOOLS = "GDB_MCP_TOOLS"  #: "gdb" | "vscode" | "all" -- which tool families to expose. Default: "all".
+
+# -- schema-dispatch machinery --------------------------------------------------
 
 SESSION_PROP = {
     "type": "string",
@@ -86,9 +94,25 @@ def _dispatch_tool(
     )
 
 
-# ============================================================================
-# gdb_* operation tables
-# ============================================================================
+def _pop_operation(name: str, args: dict[str, Any]) -> str:
+    """Pull `operation` out of the call args.
+
+    The schema's own `required: ["operation"]` should always catch a missing
+    one before this runs; this is only a defensive backstop against a client
+    that skips validation, so it fails as a clean ValueError rather than a
+    raw KeyError leaking dispatch internals.
+    """
+    operation = args.pop("operation", None)
+    if not operation:
+        raise ValueError(f"{name}: 'operation' is required")
+    return operation
+
+
+# ==============================================================================
+# gdb_* -- the standalone GDB backend
+# ==============================================================================
+
+# -- gdb_session ----------------------------------------------------------------
 
 GDB_SESSION_OPS: dict[str, dict[str, Any]] = {
     "start": {
@@ -165,7 +189,30 @@ GDB_SESSION_OPS: dict[str, dict[str, Any]] = {
     },
 }
 
-#: gdb_exec operations forwarded straight to Debugger.step()'s STEP_KINDS.
+
+async def _dispatch_gdb_session(
+    dbg: Debugger, operation: str, session: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    match operation:
+        case "start":
+            return await dbg.start(session=session, **args)
+        case "stop":
+            return await dbg.stop(session=session, **args)
+        case "status":
+            return await dbg.status(session=session)
+        case "attach":
+            return await dbg.attach(session=session, **args)
+        case "load_core":
+            return await dbg.load_core(session=session, **args)
+        case "record":
+            return await dbg.record(session=session, **args)
+        case _:
+            raise ValueError(f"Unknown gdb_session operation: {operation!r}")
+
+
+# -- gdb_exec ---------------------------------------------------------------------
+
+#: Forwarded straight to Debugger.step()'s STEP_KINDS.
 _GDB_STEP_KINDS = ("step", "next", "finish", "stepi", "nexti", "until", "return")
 #: ...and to Debugger.reverse()'s REVERSE_KINDS, prefixed "reverse-".
 _GDB_REVERSE_KINDS = ("continue", "step", "next", "finish")
@@ -232,6 +279,25 @@ GDB_EXEC_OPS: dict[str, dict[str, Any]] = {
     },
 }
 
+
+async def _dispatch_gdb_exec(
+    dbg: Debugger, operation: str, session: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    if operation == "run":
+        return await dbg.run(session=session, **args)
+    if operation == "continue":
+        return await dbg.cont(session=session, **args)
+    if operation == "interrupt":
+        return await dbg.interrupt(session=session)
+    if operation in _GDB_STEP_KINDS:
+        return await dbg.step(operation, session=session, **args)
+    if operation.startswith("reverse-"):
+        return await dbg.reverse(operation[len("reverse-") :], session=session, **args)
+    raise ValueError(f"Unknown gdb_exec operation: {operation!r}")
+
+
+# -- gdb_breakpoint -----------------------------------------------------------------
+
 GDB_BREAKPOINT_OPS: dict[str, dict[str, Any]] = {
     "set": {
         "description": "Create a breakpoint at a function, file:line, or *address.",
@@ -286,6 +352,31 @@ GDB_BREAKPOINT_OPS: dict[str, dict[str, Any]] = {
         "required": ["number"],
     },
 }
+
+
+async def _dispatch_gdb_breakpoint(
+    dbg: Debugger, operation: str, session: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    match operation:
+        case "set":
+            return await dbg.set_breakpoint(session=session, **args)
+        case "watch":
+            return await dbg.set_watchpoint(session=session, **args)
+        case "list":
+            return await dbg.list_breakpoints(session=session)
+        case "delete":
+            return await dbg.delete_breakpoint(session=session, **args)
+        case "enable":
+            return await dbg.enable_breakpoint(session=session, enabled=True, **args)
+        case "disable":
+            return await dbg.enable_breakpoint(session=session, enabled=False, **args)
+        case "modify":
+            return await dbg.modify_breakpoint(session=session, **args)
+        case _:
+            raise ValueError(f"Unknown gdb_breakpoint operation: {operation!r}")
+
+
+# -- gdb_inspect --------------------------------------------------------------------
 
 GDB_INSPECT_OPS: dict[str, dict[str, Any]] = {
     "backtrace": {
@@ -398,6 +489,45 @@ GDB_INSPECT_OPS: dict[str, dict[str, Any]] = {
     },
 }
 
+
+async def _dispatch_gdb_inspect(
+    dbg: Debugger, operation: str, session: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    match operation:
+        case "backtrace":
+            if "thread_id" in args:
+                args["thread"] = args.pop("thread_id")
+            return await dbg.backtrace(session=session, **args)
+        case "frame":
+            return await dbg.select_frame(session=session, **args)
+        case "eval":
+            return await dbg.evaluate(session=session, **args)
+        case "threads":
+            return await dbg.list_threads(session=session)
+        case "select_thread":
+            return await dbg.select_thread(session=session, **args)
+        case "registers":
+            return await dbg.registers(session=session, **args)
+        case "memory":
+            return await dbg.read_memory(session=session, **args)
+        case "globals":
+            if "max_results" in args:
+                args["limit"] = args.pop("max_results")
+            return await dbg.list_globals(session=session, **args)
+        case "disassemble":
+            if "instruction_count" in args:
+                args["count"] = args.pop("instruction_count")
+            return await dbg.disassemble(session=session, **args)
+        case "source":
+            return await dbg.list_source(session=session, **args)
+        case "program_output":
+            return await dbg.program_output(session=session)
+        case "raw":
+            return await dbg.raw(session=session, **args)
+        case _:
+            raise ValueError(f"Unknown gdb_inspect operation: {operation!r}")
+
+
 TOOLS: list[Tool] = [
     _dispatch_tool(
         "gdb_session",
@@ -422,9 +552,32 @@ TOOLS: list[Tool] = [
 ]
 
 
-# ============================================================================
-# vsc_* operation tables
-# ============================================================================
+async def _dispatch_gdb(
+    dbg: Debugger, name: str, session: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    """Route a gdb_* tool call to its operation's handler."""
+    operation = _pop_operation(name, args)
+    try:
+        match name:
+            case "gdb_session":
+                return await _dispatch_gdb_session(dbg, operation, session, args)
+            case "gdb_exec":
+                return await _dispatch_gdb_exec(dbg, operation, session, args)
+            case "gdb_breakpoint":
+                return await _dispatch_gdb_breakpoint(dbg, operation, session, args)
+            case "gdb_inspect":
+                return await _dispatch_gdb_inspect(dbg, operation, session, args)
+            case _:
+                raise ValueError(f"Unknown tool: {name}")
+    except TypeError as exc:
+        raise TypeError(f"operation={operation!r}: {exc}") from exc
+
+
+# ==============================================================================
+# vsc_* -- the VS Code bridge backend
+# ==============================================================================
+
+# -- vsc_session ------------------------------------------------------------------
 
 VSC_SESSION_OPS: dict[str, dict[str, Any]] = {
     "status": {
@@ -466,9 +619,26 @@ VSC_SESSION_OPS: dict[str, dict[str, Any]] = {
     },
 }
 
-#: vsc_exec operations forwarded straight to VSCodeDebugger.resume()'s
-#: RESUME_COMMANDS -- resume() itself validates the kind, so no local table
-#: of valid kinds is needed here beyond routing wait_stop separately.
+
+async def _dispatch_vsc_session(
+    vsc: VSCodeDebugger, operation: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    match operation:
+        case "status":
+            return await vsc.status()
+        case "configs":
+            return await vsc.configs()
+        case "launch":
+            return await vsc.launch(**args)
+        case "terminate":
+            return await vsc.terminate()
+        case _:
+            raise ValueError(f"Unknown vsc_session operation: {operation!r}")
+
+
+# -- vsc_exec -----------------------------------------------------------------------
+
+#: Forwarded straight to VSCodeDebugger.resume(), which validates the kind itself.
 _VSC_RESUME_OPS = ("continue", "next", "step", "stepIn", "stepOut", "finish", "pause")
 
 VSC_EXEC_OPS: dict[str, dict[str, Any]] = {
@@ -497,6 +667,19 @@ VSC_EXEC_OPS: dict[str, dict[str, Any]] = {
         "required": [],
     },
 }
+
+
+async def _dispatch_vsc_exec(
+    vsc: VSCodeDebugger, operation: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    if operation == "wait_stop":
+        return await vsc.wait_stop(**args)
+    if operation in _VSC_RESUME_OPS:
+        return await vsc.resume(operation, **args)
+    raise ValueError(f"Unknown vsc_exec operation: {operation!r}")
+
+
+# -- vsc_inspect --------------------------------------------------------------------
 
 VSC_INSPECT_OPS: dict[str, dict[str, Any]] = {
     "threads": {
@@ -620,153 +803,6 @@ VSC_INSPECT_OPS: dict[str, dict[str, Any]] = {
     },
 }
 
-VSCODE_TOOLS: list[Tool] = [
-    _dispatch_tool(
-        "vsc_session",
-        "Manage the VS Code debug session VS Code already owns: check status, list launch.json configs, launch one (same as pressing F5), or terminate.",
-        VSC_SESSION_OPS,
-        with_session=False,
-    ),
-    _dispatch_tool(
-        "vsc_exec",
-        "Resume, step, pause, or wait for the VS Code debug session to stop.",
-        VSC_EXEC_OPS,
-        with_session=False,
-    ),
-    _dispatch_tool(
-        "vsc_inspect",
-        "Read-only: threads, stack, frame locals, expressions, breakpoints, captured output, disassembly, memory, globals, plus a raw-GDB-command escape hatch.",
-        VSC_INSPECT_OPS,
-        with_session=False,
-    ),
-]
-
-ALL_TOOLS = VSCODE_TOOLS + TOOLS
-
-
-def select_tools(which: str = "all") -> list[Tool]:
-    """Trim the exposed surface.
-
-    If you only ever debug through VS Code, set GDB_MCP_TOOLS=vscode and the
-    standalone GDB tools disappear (and vice versa for headless core-dump
-    work).
-    """
-    which = (which or "all").strip().lower()
-    if which in ("vscode", "vsc"):
-        return list(VSCODE_TOOLS)
-    if which in ("gdb", "standalone"):
-        return list(TOOLS)
-    return list(ALL_TOOLS)
-
-
-def build_server(
-    debugger: Debugger | None = None, vscode: VSCodeDebugger | None = None
-) -> Server:
-    dbg = debugger or Debugger(gdb_path=os.environ.get("GDB_PATH", "gdb"))
-    vsc = vscode or VSCodeDebugger(
-        workspace=os.environ.get("GDB_MCP_WORKSPACE"),
-        # Hex everywhere by default, matching the gdb_* backend. Set to 0
-        # to leave the editor's own Variables pane in decimal.
-        hex_output=os.environ.get("GDB_MCP_VSCODE_HEX", "1") != "0",
-    )
-    exposed = select_tools(os.environ.get("GDB_MCP_TOOLS", "all"))
-    server: Server = Server("gdb-mcp")
-
-    @server.list_tools()
-    async def list_tools() -> list[Tool]:
-        return exposed
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-        args = dict(arguments or {})
-        try:
-            if name.startswith("vsc_"):
-                result = await _dispatch_vscode(vsc, name, args)
-            else:
-                session = args.pop("session", "default")
-                result = await _dispatch(dbg, name, session, args)
-        except BridgeError as exc:
-            error = {"error": str(exc), "tool": name}
-        except (GdbError, GdbStartupError, ValueError) as exc:
-            error = {"error": str(exc), "tool": name}
-        except TypeError as exc:
-            error = {"error": f"bad arguments for {name}: {exc}", "tool": name}
-        except asyncio.TimeoutError as exc:
-            error = {
-                "error": f"timed out: {exc}",
-                "tool": name,
-                "hint": "The program may still be running; try vsc_exec(operation='pause') or gdb_exec(operation='interrupt').",
-            }
-        else:
-            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
-        # Raise instead of building a CallToolResult ourselves: the mcp SDK's
-        # own except-handler turns this into isError=True. Constructing
-        # CallToolResult directly only works on mcp>=1.11 -- older SDKs
-        # (e.g. 1.10.x) treat a returned CallToolResult as a plain iterable
-        # of its pydantic fields instead of a result object, corrupting the
-        # response. Raising works identically across SDK versions.
-        raise RuntimeError(json.dumps(error, indent=2, default=str))
-
-    return server
-
-
-def _pop_operation(name: str, args: dict[str, Any]) -> str:
-    """Pull `operation` out of the call args.
-
-    The schema's own `required: ["operation"]` should always catch a missing
-    one before this runs; this is only a defensive backstop against a client
-    that skips validation, so it fails as a clean ValueError rather than a
-    raw KeyError leaking dispatch internals.
-    """
-    operation = args.pop("operation", None)
-    if not operation:
-        raise ValueError(f"{name}: 'operation' is required")
-    return operation
-
-
-async def _dispatch_vscode(
-    vsc: VSCodeDebugger, name: str, args: dict[str, Any]
-) -> dict[str, Any]:
-    operation = _pop_operation(name, args)
-    try:
-        match name:
-            case "vsc_session":
-                return await _dispatch_vsc_session(vsc, operation, args)
-            case "vsc_exec":
-                return await _dispatch_vsc_exec(vsc, operation, args)
-            case "vsc_inspect":
-                return await _dispatch_vsc_inspect(vsc, operation, args)
-            case _:
-                raise ValueError(f"Unknown tool: {name}")
-    except TypeError as exc:
-        raise TypeError(f"operation={operation!r}: {exc}") from exc
-
-
-async def _dispatch_vsc_session(
-    vsc: VSCodeDebugger, operation: str, args: dict[str, Any]
-) -> dict[str, Any]:
-    match operation:
-        case "status":
-            return await vsc.status()
-        case "configs":
-            return await vsc.configs()
-        case "launch":
-            return await vsc.launch(**args)
-        case "terminate":
-            return await vsc.terminate()
-        case _:
-            raise ValueError(f"Unknown vsc_session operation: {operation!r}")
-
-
-async def _dispatch_vsc_exec(
-    vsc: VSCodeDebugger, operation: str, args: dict[str, Any]
-) -> dict[str, Any]:
-    if operation == "wait_stop":
-        return await vsc.wait_stop(**args)
-    if operation in _VSC_RESUME_OPS:
-        return await vsc.resume(operation, **args)
-    raise ValueError(f"Unknown vsc_exec operation: {operation!r}")
-
 
 async def _dispatch_vsc_inspect(
     vsc: VSCodeDebugger, operation: str, args: dict[str, Any]
@@ -800,124 +836,125 @@ async def _dispatch_vsc_inspect(
             raise ValueError(f"Unknown vsc_inspect operation: {operation!r}")
 
 
-async def _dispatch(
-    dbg: Debugger, name: str, session: str, args: dict[str, Any]
+VSCODE_TOOLS: list[Tool] = [
+    _dispatch_tool(
+        "vsc_session",
+        "Manage the VS Code debug session VS Code already owns: check status, list launch.json configs, launch one (same as pressing F5), or terminate.",
+        VSC_SESSION_OPS,
+        with_session=False,
+    ),
+    _dispatch_tool(
+        "vsc_exec",
+        "Resume, step, pause, or wait for the VS Code debug session to stop.",
+        VSC_EXEC_OPS,
+        with_session=False,
+    ),
+    _dispatch_tool(
+        "vsc_inspect",
+        "Read-only: threads, stack, frame locals, expressions, breakpoints, captured output, disassembly, memory, globals, plus a raw-GDB-command escape hatch.",
+        VSC_INSPECT_OPS,
+        with_session=False,
+    ),
+]
+
+
+async def _dispatch_vsc(
+    vsc: VSCodeDebugger, name: str, args: dict[str, Any]
 ) -> dict[str, Any]:
+    """Route a vsc_* tool call to its operation's handler."""
     operation = _pop_operation(name, args)
     try:
         match name:
-            case "gdb_session":
-                return await _dispatch_gdb_session(dbg, operation, session, args)
-            case "gdb_exec":
-                return await _dispatch_gdb_exec(dbg, operation, session, args)
-            case "gdb_breakpoint":
-                return await _dispatch_gdb_breakpoint(dbg, operation, session, args)
-            case "gdb_inspect":
-                return await _dispatch_gdb_inspect(dbg, operation, session, args)
+            case "vsc_session":
+                return await _dispatch_vsc_session(vsc, operation, args)
+            case "vsc_exec":
+                return await _dispatch_vsc_exec(vsc, operation, args)
+            case "vsc_inspect":
+                return await _dispatch_vsc_inspect(vsc, operation, args)
             case _:
                 raise ValueError(f"Unknown tool: {name}")
     except TypeError as exc:
         raise TypeError(f"operation={operation!r}: {exc}") from exc
 
 
-async def _dispatch_gdb_session(
-    dbg: Debugger, operation: str, session: str, args: dict[str, Any]
-) -> dict[str, Any]:
-    match operation:
-        case "start":
-            return await dbg.start(session=session, **args)
-        case "stop":
-            return await dbg.stop(session=session, **args)
-        case "status":
-            return await dbg.status(session=session)
-        case "attach":
-            return await dbg.attach(session=session, **args)
-        case "load_core":
-            return await dbg.load_core(session=session, **args)
-        case "record":
-            return await dbg.record(session=session, **args)
-        case _:
-            raise ValueError(f"Unknown gdb_session operation: {operation!r}")
+# ==============================================================================
+# server assembly
+# ==============================================================================
+
+ALL_TOOLS = VSCODE_TOOLS + TOOLS
 
 
-async def _dispatch_gdb_exec(
-    dbg: Debugger, operation: str, session: str, args: dict[str, Any]
-) -> dict[str, Any]:
-    if operation == "run":
-        return await dbg.run(session=session, **args)
-    if operation == "continue":
-        return await dbg.cont(session=session, **args)
-    if operation == "interrupt":
-        return await dbg.interrupt(session=session)
-    if operation in _GDB_STEP_KINDS:
-        return await dbg.step(operation, session=session, **args)
-    if operation.startswith("reverse-"):
-        return await dbg.reverse(operation[len("reverse-") :], session=session, **args)
-    raise ValueError(f"Unknown gdb_exec operation: {operation!r}")
+def select_tools(which: str = "all") -> list[Tool]:
+    """Trim the exposed surface.
+
+    If you only ever debug through VS Code, set GDB_MCP_TOOLS=vscode and the
+    standalone GDB tools disappear (and vice versa for headless core-dump
+    work).
+    """
+    which = (which or "all").strip().lower()
+    if which in ("vscode", "vsc"):
+        return list(VSCODE_TOOLS)
+    if which in ("gdb", "standalone"):
+        return list(TOOLS)
+    return list(ALL_TOOLS)
 
 
-async def _dispatch_gdb_breakpoint(
-    dbg: Debugger, operation: str, session: str, args: dict[str, Any]
-) -> dict[str, Any]:
-    match operation:
-        case "set":
-            return await dbg.set_breakpoint(session=session, **args)
-        case "watch":
-            return await dbg.set_watchpoint(session=session, **args)
-        case "list":
-            return await dbg.list_breakpoints(session=session)
-        case "delete":
-            return await dbg.delete_breakpoint(session=session, **args)
-        case "enable":
-            return await dbg.enable_breakpoint(session=session, enabled=True, **args)
-        case "disable":
-            return await dbg.enable_breakpoint(session=session, enabled=False, **args)
-        case "modify":
-            return await dbg.modify_breakpoint(session=session, **args)
-        case _:
-            raise ValueError(f"Unknown gdb_breakpoint operation: {operation!r}")
+def build_server(
+    debugger: Debugger | None = None, vscode: VSCodeDebugger | None = None
+) -> Server:
+    dbg = debugger or Debugger(gdb_path=os.environ.get(ENV_GDB_PATH, "gdb"))
+    vsc = vscode or VSCodeDebugger(
+        workspace=os.environ.get(ENV_WORKSPACE),
+        hex_output=os.environ.get(ENV_VSCODE_HEX, "1") != "0",
+    )
+    exposed = select_tools(os.environ.get(ENV_TOOLS, "all"))
+    server: Server = Server("gdb-mcp")
+
+    @server.list_tools()
+    async def list_tools() -> list[Tool]:
+        return exposed
+
+    @server.call_tool()
+    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+        args = dict(arguments or {})
+        try:
+            if name.startswith("vsc_"):
+                result = await _dispatch_vsc(vsc, name, args)
+            else:
+                session = args.pop("session", "default")
+                result = await _dispatch_gdb(dbg, name, session, args)
+        except BridgeError as exc:
+            error = {"error": str(exc), "tool": name}
+        except (GdbError, GdbStartupError, ValueError) as exc:
+            error = {"error": str(exc), "tool": name}
+        except TypeError as exc:
+            error = {"error": f"bad arguments for {name}: {exc}", "tool": name}
+        except asyncio.TimeoutError as exc:
+            error = {
+                "error": f"timed out: {exc}",
+                "tool": name,
+                "hint": "The program may still be running; try vsc_exec(operation='pause') or gdb_exec(operation='interrupt').",
+            }
+        else:
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
+        # Raise instead of building a CallToolResult ourselves: the mcp SDK's
+        # own except-handler turns this into isError=True. Constructing
+        # CallToolResult directly only works on mcp>=1.11 -- older SDKs
+        # (e.g. 1.10.x) treat a returned CallToolResult as a plain iterable
+        # of its pydantic fields instead of a result object, corrupting the
+        # response. Raising works identically across SDK versions.
+        raise RuntimeError(json.dumps(error, indent=2, default=str))
+
+    return server
 
 
-async def _dispatch_gdb_inspect(
-    dbg: Debugger, operation: str, session: str, args: dict[str, Any]
-) -> dict[str, Any]:
-    match operation:
-        case "backtrace":
-            if "thread_id" in args:
-                args["thread"] = args.pop("thread_id")
-            return await dbg.backtrace(session=session, **args)
-        case "frame":
-            return await dbg.select_frame(session=session, **args)
-        case "eval":
-            return await dbg.evaluate(session=session, **args)
-        case "threads":
-            return await dbg.list_threads(session=session)
-        case "select_thread":
-            return await dbg.select_thread(session=session, **args)
-        case "registers":
-            return await dbg.registers(session=session, **args)
-        case "memory":
-            return await dbg.read_memory(session=session, **args)
-        case "globals":
-            if "max_results" in args:
-                args["limit"] = args.pop("max_results")
-            return await dbg.list_globals(session=session, **args)
-        case "disassemble":
-            if "instruction_count" in args:
-                args["count"] = args.pop("instruction_count")
-            return await dbg.disassemble(session=session, **args)
-        case "source":
-            return await dbg.list_source(session=session, **args)
-        case "program_output":
-            return await dbg.program_output(session=session)
-        case "raw":
-            return await dbg.raw(session=session, **args)
-        case _:
-            raise ValueError(f"Unknown gdb_inspect operation: {operation!r}")
+# ==============================================================================
+# entrypoint
+# ==============================================================================
 
 
 async def amain() -> None:
-    dbg = Debugger(gdb_path=os.environ.get("GDB_PATH", "gdb"))
+    dbg = Debugger(gdb_path=os.environ.get(ENV_GDB_PATH, "gdb"))
     server = build_server(dbg)
     try:
         async with stdio_server() as (read_stream, write_stream):

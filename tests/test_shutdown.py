@@ -79,7 +79,7 @@ async def test_client_disconnecting_mid_call_surfaces_a_dirty_shutdown(monkeypat
         await release.wait()
         return {"ok": True}
 
-    monkeypatch.setattr(server_module, "_dispatch", slow_dispatch)
+    monkeypatch.setattr(server_module, "_dispatch_gdb", slow_dispatch)
     srv = build_server(Debugger(gdb_path="gdb-does-not-exist"), VSCodeDebugger())
 
     server_errors: list[BaseException] = []
@@ -103,7 +103,7 @@ async def test_client_disconnecting_mid_call_surfaces_a_dirty_shutdown(monkeypat
         async with ClientSession(read_stream=client_read, write_stream=client_write) as client:
             await client.initialize()
             try:
-                await client.call_tool("gdb_start", {})
+                await client.call_tool("gdb_session", {"operation": "start"})
             except BaseException:  # noqa: BLE001 -- the point is it doesn't hang
                 pass
 

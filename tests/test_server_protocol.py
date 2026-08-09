@@ -142,12 +142,6 @@ async def test_unknown_tool_sets_is_error(tmp_path, monkeypatch):
         assert result.isError is True
 
 
-async def test_unknown_operation_sets_is_error(tmp_path, monkeypatch):
-    async with connected(tmp_path, monkeypatch) as client:
-        result = await client.call_tool("gdb_session", {"operation": "teleport"})
-        assert result.isError is True
-
-
 async def test_error_payload_names_the_failing_tool(tmp_path, monkeypatch):
     async with connected(tmp_path, monkeypatch) as client:
         result = await client.call_tool("gdb_session", {"operation": "start"})
@@ -210,6 +204,58 @@ async def test_unexpected_argument_does_not_crash_the_server(tmp_path, monkeypat
         assert "bad arguments" in payload(result)["error"]
         # the session must still be usable afterwards
         assert (await client.list_tools()).tools
+
+
+# -- negative coverage across the full tool surface ---------------------------
+#
+# test_server_schema.py already proves every operation's required-field
+# enforcement exhaustively at the schema level. These prove the same
+# rejections actually surface correctly through the real call_tool() handler
+# for every one of the 7 tools -- the wiring, not just the schema fragment.
+
+
+ALL_TOOL_NAMES = [t.name for t in ALL_TOOLS]
+
+
+@pytest.mark.parametrize("tool", ALL_TOOL_NAMES)
+async def test_unknown_operation_is_rejected_for_every_tool(tool, tmp_path, monkeypatch):
+    async with connected(tmp_path, monkeypatch) as client:
+        result = await client.call_tool(tool, {"operation": "__bogus__"})
+        assert result.isError is True
+
+
+@pytest.mark.parametrize("tool", ALL_TOOL_NAMES)
+async def test_missing_operation_is_rejected_for_every_tool(tool, tmp_path, monkeypatch):
+    async with connected(tmp_path, monkeypatch) as client:
+        result = await client.call_tool(tool, {})
+        assert result.isError is True
+        assert "required" in result.content[0].text.lower()
+
+
+async def test_unexpected_argument_on_a_vsc_operation_does_not_crash_the_server(
+    tmp_path, monkeypatch
+):
+    """The gdb_inspect case above proves this for the gdb_* side; vsc_* goes
+    through a separate dispatch function with its own **args forwarding."""
+    async with connected(tmp_path, monkeypatch) as client:
+        result = await client.call_tool(
+            "vsc_session", {"operation": "launch", "name": "x", "bogus_argument": 1}
+        )
+        assert result.isError is True
+        assert "bad arguments" in payload(result)["error"]
+        assert (await client.list_tools()).tools
+
+
+async def test_session_field_leaking_into_a_vsc_call_does_not_crash(tmp_path, monkeypatch):
+    """vsc_* tools don't declare `session` (there's only one VS Code session),
+    but nothing stops a client from sending it anyway; it must not reach a
+    VSCodeDebugger method that doesn't accept it and blow up uncleanly."""
+    async with connected(tmp_path, monkeypatch) as client:
+        result = await client.call_tool(
+            "vsc_session", {"operation": "launch", "name": "x", "session": "default"}
+        )
+        assert result.isError is True
+        assert "bad arguments" in payload(result)["error"]
 
 
 # -- launch failures ----------------------------------------------------------
