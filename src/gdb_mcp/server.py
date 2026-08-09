@@ -3,6 +3,17 @@
 This is a thin adapter: it declares the tool schemas and routes calls to
 `gdb_mcp.tools.Debugger` (standalone GDB) and `gdb_mcp.vscode_bridge`
 (the live VS Code session).
+
+The surface is 7 dispatcher tools (4 `gdb_*`, 3 `vsc_*`), not one tool per
+operation. Each takes an `operation` enum plus that operation's own fields;
+`allOf`/`if`/`then` branches on `operation` still enforce per-operation
+`required` fields the same way separate tools would (verified against the
+installed `jsonschema` version this SDK validates with -- see
+`_dispatch_tool`). Grouped by what the operations *do*, not forced together
+just to hit a number: session lifecycle, execution control, breakpoint
+management, and read-only inspection are different enough in shape and intent
+that cramming them into fewer, less cohesive tools would only make both the
+code and the model's job harder.
 """
 
 from __future__ import annotations
@@ -29,623 +40,604 @@ SESSION_PROP = {
 }
 
 
-def _schema(properties: dict[str, Any], required: list[str] | None = None) -> dict:
-    return {
-        "type": "object",
-        "properties": {"session": SESSION_PROP, **properties},
-        "required": required or [],
+def _dispatch_tool(
+    name: str,
+    description: str,
+    operations: dict[str, dict[str, Any]],
+    *,
+    with_session: bool = True,
+) -> Tool:
+    """Build one MCP tool that dispatches on an `operation` enum.
+
+    `operations` maps operation name -> {"description", "properties",
+    "required"}. Every operation's fields are declared once in the merged
+    top-level `properties` (so nothing is repeated per branch); `allOf` with
+    one `if`/`then` per operation is what still enforces that operation's
+    `required` fields, exactly as a separate per-operation tool would.
+    """
+    properties: dict[str, Any] = {"session": SESSION_PROP} if with_session else {}
+    properties["operation"] = {
+        "type": "string",
+        "enum": list(operations),
+        "description": "\n".join(
+            f"{op}: {spec['description']}" for op, spec in operations.items()
+        ),
     }
+    for spec in operations.values():
+        properties.update(spec.get("properties", {}))
+
+    all_of = [
+        {
+            "if": {"properties": {"operation": {"const": op}}},
+            "then": {"required": ["operation", *spec.get("required", [])]},
+        }
+        for op, spec in operations.items()
+    ]
+
+    return Tool(
+        name=name,
+        description=description,
+        inputSchema={
+            "type": "object",
+            "properties": properties,
+            "required": ["operation"],
+            "allOf": all_of,
+        },
+    )
 
 
-TOOLS: list[Tool] = [
-    Tool(
-        name="gdb_start",
-        description=(
-            "Start a GDB session. Optionally load a binary at the same time. "
-            "Call this before any other gdb_* tool."
-        ),
-        inputSchema=_schema(
-            {
-                "binary": {"type": "string", "description": "Path to the executable to debug."},
-                "args": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Command-line arguments for the program.",
-                },
-                "cwd": {"type": "string", "description": "Working directory for GDB."},
-                "use_init_file": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Load ~/.gdbinit (pretty printers etc). Off by default for reproducibility.",
-                },
-            }
-        ),
-    ),
-    Tool(
-        name="gdb_stop",
-        description=(
-            "End a GDB session. Defaults to detaching (leaving an attached "
-            "process running); pass kill=true to terminate the inferior."
-        ),
-        inputSchema=_schema(
-            {"kill": {"type": "boolean", "default": False, "description": "Kill the inferior instead of detaching."}}
-        ),
-    ),
-    Tool(
-        name="gdb_status",
-        description="Where is the debuggee now: running or stopped, current frame, source context.",
-        inputSchema=_schema({}),
-    ),
-    Tool(
-        name="gdb_attach",
-        description=(
-            "Attach to a running process by PID. Opens a session if none is "
-            "running. This STOPS the target process until you continue it, "
-            "and requires ptrace permission."
-        ),
-        inputSchema=_schema(
-            {
-                "pid": {"type": "integer", "description": "PID of the process to attach to."},
-                "binary": {"type": "string", "description": "Path to the binary, if symbols are not auto-found."},
+# ============================================================================
+# gdb_* operation tables
+# ============================================================================
+
+GDB_SESSION_OPS: dict[str, dict[str, Any]] = {
+    "start": {
+        "description": "Start a GDB session, optionally loading a binary. Call this before any other gdb_* operation.",
+        "properties": {
+            "binary": {
+                "type": "string",
+                "description": (
+                    "Path to an executable. Meaning depends on operation: the "
+                    "program to run (start), extra symbol source (attach), or "
+                    "the program that produced the core (load_core)."
+                ),
             },
-            ["pid"],
-        ),
-    ),
-    Tool(
-        name="gdb_load_core",
-        description=(
-            "Load a core dump for post-mortem analysis and return the crash "
-            "backtrace. Opens a session if none is running."
-        ),
-        inputSchema=_schema(
-            {
-                "binary": {"type": "string", "description": "Executable that produced the core."},
-                "core": {"type": "string", "description": "Path to the core file."},
+            "args": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Command-line arguments for the program.",
             },
-            ["binary", "core"],
+            "cwd": {"type": "string", "description": "Working directory for GDB."},
+            "use_init_file": {
+                "type": "boolean",
+                "default": False,
+                "description": "Load ~/.gdbinit (pretty printers etc). Off by default for reproducibility.",
+            },
+        },
+        "required": [],
+    },
+    "stop": {
+        "description": "End the session. Detaches by default, leaving an attached process running; pass kill=true to terminate the inferior.",
+        "properties": {
+            "kill": {
+                "type": "boolean",
+                "default": False,
+                "description": "Kill the inferior instead of detaching.",
+            },
+        },
+        "required": [],
+    },
+    "status": {
+        "description": "Where is the debuggee now: running or stopped, current frame, source context.",
+        "properties": {},
+        "required": [],
+    },
+    "attach": {
+        "description": "Attach to a running process by PID. Opens a session if none is running. STOPS the target process until you continue it, and requires ptrace permission.",
+        "properties": {
+            "pid": {"type": "integer", "description": "PID of the process to attach to."},
+        },
+        "required": ["pid"],
+    },
+    "load_core": {
+        "description": "Load a core dump for post-mortem analysis and return the crash backtrace. Opens a session if none is running.",
+        "properties": {
+            "core": {"type": "string", "description": "Path to the core file."},
+        },
+        "required": ["binary", "core"],
+    },
+    "record": {
+        "description": (
+            "Start or stop recording execution history (process record-and-replay), "
+            "required before gdb_exec(operation='reverse-*') will work. Real overhead: "
+            "turn it on only when needed, and only after stepping past any call into "
+            "code with no line info (e.g. strlen) -- gdb_exec can hang for minutes "
+            "single-stepping through one of those while recording is active."
         ),
-    ),
-    Tool(
-        name="gdb_run",
-        description="Run the loaded program from the start. Waits until it stops or exits.",
-        inputSchema=_schema(
-            {
-                "args": {"type": "array", "items": {"type": "string"}},
-                "stop_at_main": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Break at main immediately, so you can set breakpoints on lazily-loaded symbols.",
-                },
-                "timeout": {"type": "number", "default": 30, "description": "Seconds to wait for a stop."},
-            }
-        ),
-    ),
-    Tool(
-        name="gdb_continue",
-        description=(
-            "Resume execution and wait for the next stop. If it returns "
-            "state=running, the program did not stop within the timeout."
-        ),
-        inputSchema=_schema({"timeout": {"type": "number", "default": 30}}),
-    ),
-    Tool(
-        name="gdb_step",
-        description=(
-            "Single-step. kind: step (into), next (over), finish (out of frame), "
-            "stepi/nexti (instruction), until, return. The result carries the "
-            "current frame's locals: `variables` (full list) on the first stop "
-            "in a function, `changed_variables` (diff against the previous "
-            "stop) on every later one in the same function."
-        ),
-        inputSchema=_schema(
-            {
-                "kind": {
-                    "type": "string",
-                    "enum": ["step", "next", "finish", "stepi", "nexti", "until", "return"],
-                    "default": "step",
-                },
+        "properties": {
+            "action": {"type": "string", "enum": ["start", "stop"], "default": "start"},
+            "method": {
+                "type": "string",
+                "description": "Recording method, e.g. 'full' (default) or 'btrace'. Omit for GDB's default.",
+            },
+        },
+        "required": [],
+    },
+}
+
+#: gdb_exec operations forwarded straight to Debugger.step()'s STEP_KINDS.
+_GDB_STEP_KINDS = ("step", "next", "finish", "stepi", "nexti", "until", "return")
+#: ...and to Debugger.reverse()'s REVERSE_KINDS, prefixed "reverse-".
+_GDB_REVERSE_KINDS = ("continue", "step", "next", "finish")
+
+GDB_EXEC_OPS: dict[str, dict[str, Any]] = {
+    "run": {
+        "description": "Run the loaded program from the start. Waits until it stops or exits.",
+        "properties": {
+            "args": {"type": "array", "items": {"type": "string"}},
+            "stop_at_main": {
+                "type": "boolean",
+                "default": True,
+                "description": "Break at main immediately, so you can set breakpoints on lazily-loaded symbols.",
+            },
+            "timeout": {"type": "number", "default": 30, "description": "Seconds to wait for a stop."},
+        },
+        "required": [],
+    },
+    "continue": {
+        "description": "Resume execution and wait for the next stop. If it returns state=running, the program did not stop within the timeout.",
+        "properties": {},
+        "required": [],
+    },
+    "interrupt": {
+        "description": "Halt a running inferior so you can inspect it.",
+        "properties": {},
+        "required": [],
+    },
+    **{
+        kind: {
+            "description": {
+                "step": "Single-step into calls.",
+                "next": "Single-step over calls.",
+                "finish": "Run until the current frame returns.",
+                "stepi": "Step one machine instruction, into calls.",
+                "nexti": "Step one machine instruction, over calls.",
+                "until": "Run until a line greater than the current one is reached (escapes a loop).",
+                "return": "Force the current frame to return immediately.",
+            }[kind],
+            "properties": {
                 "count": {"type": "integer", "default": 1, "description": "Repeat this many times."},
                 "timeout": {"type": "number", "default": 30},
-            }
-        ),
-    ),
-    Tool(
-        name="gdb_interrupt",
-        description="Halt a running inferior so you can inspect it.",
-        inputSchema=_schema({}),
-    ),
-    Tool(
-        name="gdb_record",
-        description=(
-            "Start or stop recording the inferior's execution history "
-            "(GDB's process record-and-replay), required before gdb_reverse "
-            "will work. Recording has real overhead, so turn it on only when "
-            "you actually need to step backward -- and start it only after "
-            "stepping past any call into code with no line info (e.g. a "
-            "vectorized libc routine like strlen): gdb_step/gdb_reverse can "
-            "hang for minutes single-stepping through one of those while "
-            "recording is active."
-        ),
-        inputSchema=_schema(
-            {
-                "action": {"type": "string", "enum": ["start", "stop"], "default": "start"},
-                "method": {
-                    "type": "string",
-                    "description": "Recording method, e.g. 'full' (default) or 'btrace'. Omit for GDB's default.",
-                },
-            }
-        ),
-    ),
-    Tool(
-        name="gdb_reverse",
-        description=(
-            "Run the program BACKWARD instead of forward -- undo execution to "
-            "see how a bad value got there, rather than reproducing the bug "
-            "again from the start. Requires gdb_record(action='start') first. "
-            "kind: continue (backward to the previous stop), step (into, "
-            "backward), next (over, backward), finish (backward out of the "
-            "current frame, landing just before it was called). Same result "
-            "shape as gdb_continue/gdb_step, including the locals diff -- "
-            "'new' is where execution is heading (backward), 'old' is where "
-            "it just was."
-        ),
-        inputSchema=_schema(
-            {
-                "kind": {
-                    "type": "string",
-                    "enum": ["continue", "step", "next", "finish"],
-                    "default": "continue",
-                },
+            },
+            "required": [],
+        }
+        for kind in _GDB_STEP_KINDS
+    },
+    **{
+        f"reverse-{kind}": {
+            "description": (
+                f"Run backward: {'to the previous stop' if kind == 'continue' else kind + ', backward'}. "
+                "Undo execution to see how a bad value got there, instead of reproducing the bug from "
+                "the start. Requires gdb_session(operation='record', action='start') first. Same result "
+                "shape as the forward operations, including the locals diff -- 'new' is where execution "
+                "is heading (backward), 'old' is where it just was."
+            ),
+            "properties": {
                 "count": {"type": "integer", "default": 1, "description": "Repeat this many times."},
                 "timeout": {"type": "number", "default": 30},
-            }
-        ),
-    ),
-    Tool(
-        name="gdb_break",
-        description="Set a breakpoint at a function, file:line, or *address.",
-        inputSchema=_schema(
-            {
-                "location": {"type": "string", "description": "e.g. 'main', 'foo.c:42', '*0x400ab0'"},
-                "condition": {"type": "string", "description": "Only stop when this expression is true."},
-                "temporary": {"type": "boolean", "default": False, "description": "Delete after first hit."},
-                "ignore_count": {"type": "integer", "description": "Skip the first N hits."},
             },
-            ["location"],
+            "required": [],
+        }
+        for kind in _GDB_REVERSE_KINDS
+    },
+}
+
+GDB_BREAKPOINT_OPS: dict[str, dict[str, Any]] = {
+    "set": {
+        "description": "Create a breakpoint at a function, file:line, or *address.",
+        "properties": {
+            "location": {"type": "string", "description": "e.g. 'main', 'foo.c:42', '*0x400ab0'"},
+            "condition": {"type": "string", "description": "Only stop when this expression is true."},
+            "temporary": {"type": "boolean", "default": False, "description": "Delete after first hit."},
+            "ignore_count": {"type": "integer", "description": "Skip this many hits before stopping."},
+        },
+        "required": ["location"],
+    },
+    "watch": {
+        "description": "Create a watchpoint that stops when an expression's value changes.",
+        "properties": {
+            "expression": {"type": "string"},
+            "kind": {"type": "string", "enum": ["write", "read", "access"], "default": "write"},
+        },
+        "required": ["expression"],
+    },
+    "list": {
+        "description": "List all breakpoints and watchpoints with their hit counts.",
+        "properties": {},
+        "required": [],
+    },
+    "delete": {
+        "description": "Delete a breakpoint by number.",
+        "properties": {"number": {"type": "integer"}},
+        "required": ["number"],
+    },
+    "enable": {
+        "description": "Enable a breakpoint by number, without deleting it.",
+        "properties": {"number": {"type": "integer"}},
+        "required": ["number"],
+    },
+    "disable": {
+        "description": "Disable a breakpoint by number, without deleting it.",
+        "properties": {"number": {"type": "integer"}},
+        "required": ["number"],
+    },
+    "modify": {
+        "description": (
+            "Change an existing breakpoint's condition or ignore count in place, "
+            "without deleting and recreating it (which would lose its number and "
+            "accumulated hit count). condition=\"\" clears the condition; "
+            "ignore_count=0 clears the ignore count."
         ),
-    ),
-    Tool(
-        name="gdb_watch",
-        description="Set a watchpoint that stops when an expression's value changes.",
-        inputSchema=_schema(
-            {
-                "expression": {"type": "string"},
-                "kind": {"type": "string", "enum": ["write", "read", "access"], "default": "write"},
-            },
-            ["expression"],
+        "properties": {
+            "number": {"type": "integer"},
+            "condition": {"type": "string", "description": "Only stop when this expression is true."},
+            "ignore_count": {"type": "integer", "description": "Skip this many hits before stopping."},
+        },
+        "required": ["number"],
+    },
+}
+
+GDB_INSPECT_OPS: dict[str, dict[str, Any]] = {
+    "backtrace": {
+        "description": "Call stack of the current (or given) thread.",
+        "properties": {
+            "limit": {"type": "integer", "default": 30},
+            "full": {"type": "boolean", "default": False, "description": "Include local variables."},
+            "thread_id": {"type": "integer", "description": "Thread id; defaults to current."},
+        },
+        "required": [],
+    },
+    "frame": {
+        "description": "Select a stack frame and return its locals, arguments, and source context.",
+        "properties": {"level": {"type": "integer", "description": "0 is the innermost frame."}},
+        "required": ["level"],
+    },
+    "eval": {
+        "description": (
+            "Evaluate a C/C++ expression in the selected frame. Inferior function "
+            "calls are blocked unless allow_function_calls=true, because they "
+            "really execute inside the target process."
         ),
-    ),
-    Tool(
-        name="gdb_breakpoints",
-        description="List all breakpoints and watchpoints with their hit counts.",
-        inputSchema=_schema({}),
-    ),
-    Tool(
-        name="gdb_delete_breakpoint",
-        description="Delete a breakpoint by number.",
-        inputSchema=_schema({"number": {"type": "integer"}}, ["number"]),
-    ),
-    Tool(
-        name="gdb_enable_breakpoint",
-        description="Enable or disable a breakpoint by number, without deleting it.",
-        inputSchema=_schema(
-            {
-                "number": {"type": "integer"},
-                "enabled": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "false disables the breakpoint instead of enabling it.",
-                },
-            },
-            ["number"],
-        ),
-    ),
-    Tool(
-        name="gdb_modify_breakpoint",
-        description=(
-            "Change an existing breakpoint's condition or ignore count in "
-            "place, without deleting and recreating it (which would lose its "
-            "number and accumulated hit count). Pass condition=\"\" to clear "
-            "the condition, or ignore_count=0 to clear the ignore count."
-        ),
-        inputSchema=_schema(
-            {
-                "number": {"type": "integer"},
-                "condition": {
-                    "type": "string",
-                    "description": "New condition expression. Empty string clears it.",
-                },
-                "ignore_count": {
-                    "type": "integer",
-                    "description": "Skip this many future hits before stopping. 0 clears it.",
-                },
-            },
-            ["number"],
-        ),
-    ),
-    Tool(
-        name="gdb_backtrace",
-        description="Show the call stack of the current (or given) thread.",
-        inputSchema=_schema(
-            {
-                "limit": {"type": "integer", "default": 30},
-                "full": {"type": "boolean", "default": False, "description": "Include local variables."},
-                "thread": {"type": "integer", "description": "Thread id; defaults to current."},
-            }
-        ),
-    ),
-    Tool(
-        name="gdb_frame",
-        description="Select a stack frame and return its locals, arguments, and source context.",
-        inputSchema=_schema({"level": {"type": "integer", "description": "0 is the innermost frame."}}, ["level"]),
-    ),
-    Tool(
-        name="gdb_eval",
-        description=(
-            "Evaluate a C/C++ expression in the selected frame. Inferior "
-            "function calls are blocked unless allow_function_calls=true, "
-            "because they really execute inside the target process."
-        ),
-        inputSchema=_schema(
-            {
-                "expression": {"type": "string"},
-                "allow_function_calls": {"type": "boolean", "default": False},
-            },
-            ["expression"],
-        ),
-    ),
-    Tool(
-        name="gdb_threads",
-        description="List all threads with their current frames.",
-        inputSchema=_schema({}),
-    ),
-    Tool(
-        name="gdb_select_thread",
-        description="Switch the current thread.",
-        inputSchema=_schema({"thread_id": {"type": "integer"}}, ["thread_id"]),
-    ),
-    Tool(
-        name="gdb_registers",
-        description="Read CPU registers, optionally filtered by name.",
-        inputSchema=_schema({"names": {"type": "array", "items": {"type": "string"}}}),
-    ),
-    Tool(
-        name="gdb_memory",
-        description=(
+        "properties": {
+            "expression": {"type": "string"},
+            "allow_function_calls": {"type": "boolean", "default": False},
+        },
+        "required": ["expression"],
+    },
+    "threads": {
+        "description": "List all threads with their current frames.",
+        "properties": {},
+        "required": [],
+    },
+    "select_thread": {
+        "description": "Switch the current thread.",
+        "properties": {"thread_id": {"type": "integer"}},
+        "required": ["thread_id"],
+    },
+    "registers": {
+        "description": "Read CPU registers, optionally filtered by name.",
+        "properties": {"names": {"type": "array", "items": {"type": "string"}}},
+        "required": [],
+    },
+    "memory": {
+        "description": (
             "Dump a range of memory in hex. Reads `count` words of `word_size` "
             "bytes, laid out in rows with an ASCII gutter. word_size follows "
             "GDB's x/ sizes: 4 = word, 8 = giant word (pointers on x86-64)."
         ),
-        inputSchema=_schema(
-            {
-                "address": {
-                    "type": "string",
-                    "description": "Any GDB expression: '0x7fff...', '&buf', '$sp', 'pkt->payload'",
-                },
-                "count": {"type": "integer", "default": 16, "description": "Number of words to read."},
-                "word_size": {
-                    "type": "integer",
-                    "enum": [4, 8],
-                    "default": 8,
-                    "description": "Bytes per word: 4 = word, 8 = giant word.",
-                },
-                "per_row": {"type": "integer", "description": "Words per row; defaults to a 16-byte row."},
+        "properties": {
+            "address": {
+                "type": "string",
+                "description": "Any GDB expression: '0x7fff...', '&buf', '$sp', 'pkt->payload'",
             },
-            ["address"],
-        ),
-    ),
-    Tool(
-        name="gdb_globals",
-        description=(
-            "List global and file-static variables, optionally with their "
-            "current values. Locals tools do NOT show globals -- use this to "
+            "count": {"type": "integer", "default": 16, "description": "Number of words to read."},
+            "word_size": {
+                "type": "integer",
+                "enum": [4, 8],
+                "default": 8,
+                "description": "Bytes per word: 4 = word, 8 = giant word.",
+            },
+            "per_row": {"type": "integer", "description": "Words per row; defaults to a 16-byte row."},
+        },
+        "required": ["address"],
+    },
+    "globals": {
+        "description": (
+            "List global and file-static variables, optionally with their current "
+            "values. Locals-based operations do NOT show globals -- use this to "
             "discover them. Pass a `pattern` regex to narrow the results."
         ),
-        inputSchema=_schema(
-            {
-                "pattern": {
-                    "type": "string",
-                    "description": (
-                        "Unanchored regex matched against the name. Anchor it "
-                        "('^g_') or it also matches mid-name and drags in "
-                        "linked-library symbols. Strongly recommended."
-                    ),
-                },
-                "include_values": {
-                    "type": "boolean",
-                    "default": False,
-                    "description": "Evaluate each variable to fetch its current value.",
-                },
-                "limit": {"type": "integer", "default": 200},
-            }
-        ),
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": (
+                    "Unanchored regex matched against the name. Anchor it ('^g_') "
+                    "or it also matches mid-name and drags in linked-library symbols."
+                ),
+            },
+            "include_values": {"type": "boolean", "default": False},
+            "max_results": {"type": "integer", "default": 200},
+        },
+        "required": [],
+    },
+    "disassemble": {
+        "description": "Disassemble around the current PC or a given location. Returns a flat list of instructions, each annotated with its source line.",
+        "properties": {
+            "location": {"type": "string"},
+            "instruction_count": {"type": "integer", "default": 20},
+        },
+        "required": [],
+    },
+    "source": {
+        "description": "Show source code at the current location or a given file:line.",
+        "properties": {
+            "location": {"type": "string"},
+            "lines": {"type": "integer", "default": 20},
+        },
+        "required": [],
+    },
+    "program_output": {
+        "description": "Drain anything the debugged program has written to its stdout/stderr.",
+        "properties": {},
+        "required": [],
+    },
+    "raw": {
+        "description": "Escape hatch: run an arbitrary GDB CLI command and return its console output. Use when no dedicated operation fits.",
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+    },
+}
+
+TOOLS: list[Tool] = [
+    _dispatch_tool(
+        "gdb_session",
+        "Manage a standalone GDB session's lifecycle: start it, stop it, check its status, attach to a running process, load a core dump, or toggle execution recording.",
+        GDB_SESSION_OPS,
     ),
-    Tool(
-        name="gdb_disassemble",
-        description=(
-            "Disassemble around the current PC or a given location. Returns a "
-            "flat list of instructions, each annotated with its source line."
-        ),
-        inputSchema=_schema(
-            {
-                "location": {"type": "string"},
-                "count": {"type": "integer", "default": 20},
-            }
-        ),
+    _dispatch_tool(
+        "gdb_exec",
+        "Advance or rewind execution and wait for the next stop. Forward operations: run, continue, interrupt, step, next, finish, stepi, nexti, until, return. Backward (requires gdb_session record first): reverse-continue, reverse-step, reverse-next, reverse-finish.",
+        GDB_EXEC_OPS,
     ),
-    Tool(
-        name="gdb_source",
-        description="Show source code at the current location or a given file:line.",
-        inputSchema=_schema(
-            {"location": {"type": "string"}, "lines": {"type": "integer", "default": 20}}
-        ),
+    _dispatch_tool(
+        "gdb_breakpoint",
+        "Create, list, or edit breakpoints and watchpoints.",
+        GDB_BREAKPOINT_OPS,
     ),
-    Tool(
-        name="gdb_program_output",
-        description="Drain anything the debugged program has written to its stdout/stderr.",
-        inputSchema=_schema({}),
-    ),
-    Tool(
-        name="gdb_raw",
-        description=(
-            "Escape hatch: run an arbitrary GDB CLI command and return its "
-            "console output. Use when no dedicated tool fits."
-        ),
-        inputSchema=_schema({"command": {"type": "string"}}, ["command"]),
+    _dispatch_tool(
+        "gdb_inspect",
+        "Read-only: stack, locals, expressions, threads, registers, memory, globals, disassembly, source, captured program output, plus a raw-GDB-command escape hatch.",
+        GDB_INSPECT_OPS,
     ),
 ]
 
 
-def _vsc(properties: dict[str, Any], required: list[str] | None = None) -> dict:
-    return {"type": "object", "properties": properties, "required": required or []}
+# ============================================================================
+# vsc_* operation tables
+# ============================================================================
 
-
-#: Tools that drive the debug session VS Code already owns, via the bridge
-#: extension.  Use these whenever the user launched with F5 -- a second gdb
-#: cannot attach to a process the VS Code adapter is already tracing.
-VSCODE_TOOLS: list[Tool] = [
-    Tool(
-        name="vsc_status",
-        description=(
+VSC_SESSION_OPS: dict[str, dict[str, Any]] = {
+    "status": {
+        "description": (
             "PREFERRED FIRST CALL when the user is debugging in VS Code. Reports "
             "whether a debug session is active, whether it is stopped, and the "
             "current frame with surrounding source."
         ),
-        inputSchema=_vsc({}),
-    ),
-    Tool(
-        name="vsc_configs",
-        description="List the launch.json configurations available in the workspace.",
-        inputSchema=_vsc({}),
-    ),
-    Tool(
-        name="vsc_launch",
-        description=(
+        "properties": {},
+        "required": [],
+    },
+    "configs": {
+        "description": "List the launch.json configurations available in the workspace.",
+        "properties": {},
+        "required": [],
+    },
+    "launch": {
+        "description": (
             "Start a launch.json configuration -- exactly what pressing F5 does, "
             "including its preLaunchTask, envFile and args. Use this to run the "
             "project after making changes."
         ),
-        inputSchema=_vsc(
-            {
-                "name": {"type": "string", "description": "Configuration name from launch.json."},
-                "folder": {"type": "string", "description": "Workspace folder name, for multi-root."},
-                "wait_for_stop": {
-                    "type": "boolean",
-                    "default": True,
-                    "description": "Wait for the first breakpoint/exception before returning.",
-                },
-                "timeout": {"type": "number", "default": 120},
+        "properties": {
+            "name": {"type": "string", "description": "Configuration name from launch.json."},
+            "folder": {"type": "string", "description": "Workspace folder name, for multi-root."},
+            "wait_for_stop": {
+                "type": "boolean",
+                "default": True,
+                "description": "Wait for the first breakpoint/exception before returning.",
             },
-            ["name"],
-        ),
-    ),
-    Tool(
-        name="vsc_terminate",
-        description="Stop the active VS Code debug session.",
-        inputSchema=_vsc({}),
-    ),
-    Tool(
-        name="vsc_continue",
-        description=(
-            "Resume the program and wait for the next stop. Returns state=running "
-            "if it did not stop within the timeout."
-        ),
-        inputSchema=_vsc({"timeout": {"type": "number", "default": 30}}),
-    ),
-    Tool(
-        name="vsc_step",
-        description=(
-            "Step the program: next (over), step (into), stepOut (finish frame). "
-            "The result carries the current frame's locals: `variables` (full "
-            "list) on the first stop in a function, `changed_variables` (diff "
-            "against the previous stop) on every later one in the same function."
-        ),
-        inputSchema=_vsc(
-            {
-                "kind": {
-                    "type": "string",
-                    "enum": ["next", "step", "stepIn", "stepOut", "finish"],
-                    "default": "next",
-                },
+            "timeout": {"type": "number", "default": 120},
+        },
+        "required": ["name"],
+    },
+    "terminate": {
+        "description": "Stop the active VS Code debug session.",
+        "properties": {},
+        "required": [],
+    },
+}
+
+#: vsc_exec operations forwarded straight to VSCodeDebugger.resume()'s
+#: RESUME_COMMANDS -- resume() itself validates the kind, so no local table
+#: of valid kinds is needed here beyond routing wait_stop separately.
+_VSC_RESUME_OPS = ("continue", "next", "step", "stepIn", "stepOut", "finish", "pause")
+
+VSC_EXEC_OPS: dict[str, dict[str, Any]] = {
+    **{
+        op: {
+            "description": {
+                "continue": "Resume the program and wait for the next stop.",
+                "next": "Step over (the DAP 'next' request).",
+                "step": "Step into (the DAP 'stepIn' request).",
+                "stepIn": "Step into.",
+                "stepOut": "Step out of the current frame (finish).",
+                "finish": "Step out of the current frame (same as stepOut).",
+                "pause": "Halt a running program so you can inspect it.",
+            }[op],
+            "properties": {
                 "thread_id": {"type": "integer"},
                 "timeout": {"type": "number", "default": 30},
-            }
-        ),
-    ),
-    Tool(
-        name="vsc_pause",
-        description="Halt a running program so you can inspect it.",
-        inputSchema=_vsc({"timeout": {"type": "number", "default": 15}}),
-    ),
-    Tool(
-        name="vsc_wait_stop",
-        description=(
-            "Block until the program hits a breakpoint, crashes, or exits. Use "
-            "after launching a program that runs for a while."
-        ),
-        inputSchema=_vsc({"timeout": {"type": "number", "default": 60}}),
-    ),
-    Tool(
-        name="vsc_threads",
-        description="List threads in the VS Code debug session.",
-        inputSchema=_vsc({}),
-    ),
-    Tool(
-        name="vsc_backtrace",
-        description="Call stack of the stopped thread, with frame ids for vsc_frame.",
-        inputSchema=_vsc(
-            {
-                "thread_id": {"type": "integer"},
-                "limit": {"type": "integer", "default": 30},
-            }
-        ),
-    ),
-    Tool(
-        name="vsc_frame",
-        description=(
-            "Locals, arguments and registers for a frame, with structs expanded "
-            "one level. Pass a frame id from vsc_backtrace."
-        ),
-        inputSchema=_vsc(
-            {
-                "frame_id": {"type": "integer"},
-                "expand_depth": {"type": "integer", "default": 1},
             },
-            ["frame_id"],
-        ),
-    ),
-    Tool(
-        name="vsc_eval",
-        description="Evaluate a C/C++ expression in a frame of the VS Code session.",
-        inputSchema=_vsc(
-            {
-                "expression": {"type": "string"},
-                "frame_id": {"type": "integer", "description": "Defaults to the top frame."},
-            },
-            ["expression"],
-        ),
-    ),
-    Tool(
-        name="vsc_exec",
-        description=(
-            "Run a raw GDB command inside the VS Code session via cppdbg's "
-            "'-exec' escape (e.g. 'info registers', 'thread apply all bt'). "
-            "Requires a GDB-backed session: not available with cppvsdbg (the "
-            "Windows Visual Studio debugger), debugpy, or delve."
-        ),
-        inputSchema=_vsc({"command": {"type": "string"}}, ["command"]),
-    ),
-    Tool(
-        name="vsc_breakpoints",
-        description="List the breakpoints currently set in VS Code.",
-        inputSchema=_vsc({}),
-    ),
-    Tool(
-        name="vsc_set_breakpoints",
-        description=(
-            "Add or remove breakpoints in VS Code's UI, so the user sees them in "
-            "the editor. Each entry is {file, line} or {functionName}, with an "
-            "optional condition."
-        ),
-        inputSchema=_vsc(
-            {
-                "breakpoints": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "file": {"type": "string"},
-                            "line": {"type": "integer"},
-                            "functionName": {"type": "string"},
-                            "condition": {"type": "string"},
-                            "hitCondition": {"type": "string"},
-                        },
+            "required": [],
+        }
+        for op in _VSC_RESUME_OPS
+    },
+    "wait_stop": {
+        "description": "Block until the program hits a breakpoint, crashes, or exits. Use after launching a program that runs for a while.",
+        "properties": {"timeout": {"type": "number", "default": 60}},
+        "required": [],
+    },
+}
+
+VSC_INSPECT_OPS: dict[str, dict[str, Any]] = {
+    "threads": {
+        "description": "List threads in the VS Code debug session.",
+        "properties": {},
+        "required": [],
+    },
+    "backtrace": {
+        "description": "Call stack of the stopped thread, with frame ids for operation=frame.",
+        "properties": {
+            "thread_id": {"type": "integer"},
+            "limit": {"type": "integer", "default": 30},
+        },
+        "required": [],
+    },
+    "frame": {
+        "description": "Locals, arguments and registers for a frame, with structs expanded one level. Pass a frame id from operation=backtrace.",
+        "properties": {
+            "frame_id": {"type": "integer"},
+            "expand_depth": {"type": "integer", "default": 1},
+        },
+        "required": ["frame_id"],
+    },
+    "eval": {
+        "description": "Evaluate a C/C++ expression in a frame of the VS Code session.",
+        "properties": {
+            "expression": {"type": "string"},
+            "frame_id": {"type": "integer", "description": "Defaults to the top frame."},
+        },
+        "required": ["expression"],
+    },
+    "breakpoints": {
+        "description": "List the breakpoints currently set in VS Code.",
+        "properties": {},
+        "required": [],
+    },
+    "set_breakpoints": {
+        "description": "Add or remove breakpoints in VS Code's UI, so the user sees them in the editor. Each entry is {file, line} or {functionName}, with an optional condition.",
+        "properties": {
+            "breakpoints": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string"},
+                        "line": {"type": "integer"},
+                        "functionName": {"type": "string"},
+                        "condition": {"type": "string"},
+                        "hitCondition": {"type": "string"},
                     },
                 },
-                "action": {
-                    "type": "string",
-                    "enum": ["add", "remove", "clear"],
-                    "default": "add",
-                },
             },
-            ["breakpoints"],
-        ),
-    ),
-    Tool(
-        name="vsc_output",
-        description=(
+            "action": {"type": "string", "enum": ["add", "remove", "clear"], "default": "add"},
+        },
+        "required": ["breakpoints"],
+    },
+    "output": {
+        "description": (
             "Drain stdout/stderr the debugged program has produced. Output is "
-            "delivered once: stop and step results already include whatever "
-            "was pending, so an empty result here means nothing new."
+            "delivered once: stop and step results already include whatever was "
+            "pending, so an empty result here means nothing new."
         ),
-        inputSchema=_vsc({}),
-    ),
-    Tool(
-        name="vsc_disassemble",
-        description="Disassemble at an address reference from vsc_backtrace's `pc`.",
-        inputSchema=_vsc(
-            {
-                "memory_reference": {"type": "string"},
-                "count": {"type": "integer", "default": 20},
+        "properties": {},
+        "required": [],
+    },
+    "disassemble": {
+        "description": "Disassemble at an address reference from operation=backtrace's `pc`.",
+        "properties": {
+            "memory_reference": {"type": "string"},
+            "instruction_count": {"type": "integer", "default": 20},
+        },
+        "required": ["memory_reference"],
+    },
+    "memory": {
+        "description": (
+            "Dump a range of memory in hex, in rows with an ASCII gutter. Accepts "
+            "a raw address or an expression like '&buf' or 'pkt->payload'. "
+            "word_size: 4 = word, 8 = giant word."
+        ),
+        "properties": {
+            "memory_reference": {
+                "type": "string",
+                "description": "Hex address, a `pc` from operation=backtrace, or an expression.",
             },
-            ["memory_reference"],
-        ),
-    ),
-    Tool(
-        name="vsc_memory",
-        description=(
-            "Dump a range of memory in hex, in rows with an ASCII gutter. "
-            "Accepts a raw address or an expression like '&buf' or "
-            "'pkt->payload'. word_size: 4 = word, 8 = giant word."
-        ),
-        inputSchema=_vsc(
-            {
-                "memory_reference": {
-                    "type": "string",
-                    "description": "Hex address, a `pc` from vsc_backtrace, or an expression.",
-                },
-                "count": {"type": "integer", "default": 16, "description": "Number of words to read."},
-                "word_size": {
-                    "type": "integer",
-                    "enum": [4, 8],
-                    "default": 8,
-                    "description": "Bytes per word: 4 = word, 8 = giant word.",
-                },
-                "per_row": {"type": "integer", "description": "Words per row; defaults to a 16-byte row."},
+            "count": {"type": "integer", "default": 16, "description": "Number of words to read."},
+            "word_size": {
+                "type": "integer",
+                "enum": [4, 8],
+                "default": 8,
+                "description": "Bytes per word: 4 = word, 8 = giant word.",
             },
-            ["memory_reference"],
-        ),
-    ),
-    Tool(
-        name="vsc_globals",
-        description=(
+            "per_row": {"type": "integer", "description": "Words per row; defaults to a 16-byte row."},
+        },
+        "required": ["memory_reference"],
+    },
+    "globals": {
+        "description": (
             "List global and file-static variables. Needed for cppdbg, whose "
             "frames expose only Locals and Registers. Adapters that publish a "
-            "Globals scope (debugpy) already surface them through vsc_frame, so "
-            "check there first. Requires a GDB-backed session."
+            "Globals scope (debugpy) already surface them through operation=frame, "
+            "so check there first. Requires a GDB-backed session."
         ),
-        inputSchema=_vsc(
-            {
-                "pattern": {
-                    "type": "string",
-                    "description": (
-                        "Unanchored regex matched against the name; anchor it "
-                        "('^g_') to exclude linked-library symbols."
-                    ),
-                },
-                "include_values": {"type": "boolean", "default": False},
-            }
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "Unanchored regex matched against the name; anchor it ('^g_') to exclude linked-library symbols.",
+            },
+            "include_values": {"type": "boolean", "default": False},
+        },
+        "required": [],
+    },
+    "raw": {
+        "description": (
+            "Escape hatch: run a raw GDB command inside the VS Code session via "
+            "cppdbg's '-exec' escape (e.g. 'info registers', 'thread apply all "
+            "bt'). Requires a GDB-backed session: not available with cppvsdbg "
+            "(the Windows Visual Studio debugger), debugpy, or delve."
         ),
+        "properties": {"command": {"type": "string"}},
+        "required": ["command"],
+    },
+}
+
+VSCODE_TOOLS: list[Tool] = [
+    _dispatch_tool(
+        "vsc_session",
+        "Manage the VS Code debug session VS Code already owns: check status, list launch.json configs, launch one (same as pressing F5), or terminate.",
+        VSC_SESSION_OPS,
+        with_session=False,
+    ),
+    _dispatch_tool(
+        "vsc_exec",
+        "Resume, step, pause, or wait for the VS Code debug session to stop.",
+        VSC_EXEC_OPS,
+        with_session=False,
+    ),
+    _dispatch_tool(
+        "vsc_inspect",
+        "Read-only: threads, stack, frame locals, expressions, breakpoints, captured output, disassembly, memory, globals, plus a raw-GDB-command escape hatch.",
+        VSC_INSPECT_OPS,
+        with_session=False,
     ),
 ]
 
@@ -655,9 +647,9 @@ ALL_TOOLS = VSCODE_TOOLS + TOOLS
 def select_tools(which: str = "all") -> list[Tool]:
     """Trim the exposed surface.
 
-    48 tools is a lot for a model to choose between. If you only ever debug
-    through VS Code, set GDB_MCP_TOOLS=vscode and the standalone GDB tools
-    disappear (and vice versa for headless core-dump work).
+    If you only ever debug through VS Code, set GDB_MCP_TOOLS=vscode and the
+    standalone GDB tools disappear (and vice versa for headless core-dump
+    work).
     """
     which = (which or "all").strip().lower()
     if which in ("vscode", "vsc"):
@@ -703,7 +695,7 @@ def build_server(
             error = {
                 "error": f"timed out: {exc}",
                 "tool": name,
-                "hint": "The program may still be running; try vsc_pause or gdb_interrupt.",
+                "hint": "The program may still be running; try vsc_exec(operation='pause') or gdb_exec(operation='interrupt').",
             }
         else:
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
@@ -718,117 +710,210 @@ def build_server(
     return server
 
 
+def _pop_operation(name: str, args: dict[str, Any]) -> str:
+    """Pull `operation` out of the call args.
+
+    The schema's own `required: ["operation"]` should always catch a missing
+    one before this runs; this is only a defensive backstop against a client
+    that skips validation, so it fails as a clean ValueError rather than a
+    raw KeyError leaking dispatch internals.
+    """
+    operation = args.pop("operation", None)
+    if not operation:
+        raise ValueError(f"{name}: 'operation' is required")
+    return operation
+
+
 async def _dispatch_vscode(
     vsc: VSCodeDebugger, name: str, args: dict[str, Any]
 ) -> dict[str, Any]:
-    match name:
-        case "vsc_status":
+    operation = _pop_operation(name, args)
+    try:
+        match name:
+            case "vsc_session":
+                return await _dispatch_vsc_session(vsc, operation, args)
+            case "vsc_exec":
+                return await _dispatch_vsc_exec(vsc, operation, args)
+            case "vsc_inspect":
+                return await _dispatch_vsc_inspect(vsc, operation, args)
+            case _:
+                raise ValueError(f"Unknown tool: {name}")
+    except TypeError as exc:
+        raise TypeError(f"operation={operation!r}: {exc}") from exc
+
+
+async def _dispatch_vsc_session(
+    vsc: VSCodeDebugger, operation: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    match operation:
+        case "status":
             return await vsc.status()
-        case "vsc_configs":
+        case "configs":
             return await vsc.configs()
-        case "vsc_launch":
+        case "launch":
             return await vsc.launch(**args)
-        case "vsc_terminate":
+        case "terminate":
             return await vsc.terminate()
-        case "vsc_continue":
-            return await vsc.resume("continue", **args)
-        case "vsc_step":
-            kind = args.pop("kind", "next")
-            return await vsc.resume(kind, **args)
-        case "vsc_pause":
-            return await vsc.resume("pause", **args)
-        case "vsc_wait_stop":
-            return await vsc.wait_stop(**args)
-        case "vsc_threads":
-            return await vsc.threads()
-        case "vsc_backtrace":
-            return await vsc.backtrace(**args)
-        case "vsc_frame":
-            return await vsc.frame(**args)
-        case "vsc_eval":
-            return await vsc.evaluate(**args)
-        case "vsc_exec":
-            return await vsc.exec_gdb(**args)
-        case "vsc_breakpoints":
-            return await vsc.list_breakpoints()
-        case "vsc_set_breakpoints":
-            return await vsc.set_breakpoints(**args)
-        case "vsc_output":
-            return await vsc.program_output()
-        case "vsc_disassemble":
-            return await vsc.disassemble(**args)
-        case "vsc_memory":
-            return await vsc.read_memory(**args)
-        case "vsc_globals":
-            return await vsc.list_globals(**args)
         case _:
-            raise ValueError(f"Unknown tool: {name}")
+            raise ValueError(f"Unknown vsc_session operation: {operation!r}")
+
+
+async def _dispatch_vsc_exec(
+    vsc: VSCodeDebugger, operation: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    if operation == "wait_stop":
+        return await vsc.wait_stop(**args)
+    if operation in _VSC_RESUME_OPS:
+        return await vsc.resume(operation, **args)
+    raise ValueError(f"Unknown vsc_exec operation: {operation!r}")
+
+
+async def _dispatch_vsc_inspect(
+    vsc: VSCodeDebugger, operation: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    match operation:
+        case "threads":
+            return await vsc.threads()
+        case "backtrace":
+            return await vsc.backtrace(**args)
+        case "frame":
+            return await vsc.frame(**args)
+        case "eval":
+            return await vsc.evaluate(**args)
+        case "breakpoints":
+            return await vsc.list_breakpoints()
+        case "set_breakpoints":
+            return await vsc.set_breakpoints(**args)
+        case "output":
+            return await vsc.program_output()
+        case "disassemble":
+            if "instruction_count" in args:
+                args["count"] = args.pop("instruction_count")
+            return await vsc.disassemble(**args)
+        case "memory":
+            return await vsc.read_memory(**args)
+        case "globals":
+            return await vsc.list_globals(**args)
+        case "raw":
+            return await vsc.exec_gdb(**args, tool_name="vsc_inspect(operation='raw')")
+        case _:
+            raise ValueError(f"Unknown vsc_inspect operation: {operation!r}")
 
 
 async def _dispatch(
     dbg: Debugger, name: str, session: str, args: dict[str, Any]
 ) -> dict[str, Any]:
-    match name:
-        case "gdb_start":
+    operation = _pop_operation(name, args)
+    try:
+        match name:
+            case "gdb_session":
+                return await _dispatch_gdb_session(dbg, operation, session, args)
+            case "gdb_exec":
+                return await _dispatch_gdb_exec(dbg, operation, session, args)
+            case "gdb_breakpoint":
+                return await _dispatch_gdb_breakpoint(dbg, operation, session, args)
+            case "gdb_inspect":
+                return await _dispatch_gdb_inspect(dbg, operation, session, args)
+            case _:
+                raise ValueError(f"Unknown tool: {name}")
+    except TypeError as exc:
+        raise TypeError(f"operation={operation!r}: {exc}") from exc
+
+
+async def _dispatch_gdb_session(
+    dbg: Debugger, operation: str, session: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    match operation:
+        case "start":
             return await dbg.start(session=session, **args)
-        case "gdb_stop":
+        case "stop":
             return await dbg.stop(session=session, **args)
-        case "gdb_status":
+        case "status":
             return await dbg.status(session=session)
-        case "gdb_attach":
+        case "attach":
             return await dbg.attach(session=session, **args)
-        case "gdb_load_core":
+        case "load_core":
             return await dbg.load_core(session=session, **args)
-        case "gdb_run":
-            return await dbg.run(session=session, **args)
-        case "gdb_continue":
-            return await dbg.cont(session=session, **args)
-        case "gdb_step":
-            return await dbg.step(session=session, **args)
-        case "gdb_interrupt":
-            return await dbg.interrupt(session=session)
-        case "gdb_record":
+        case "record":
             return await dbg.record(session=session, **args)
-        case "gdb_reverse":
-            return await dbg.reverse(session=session, **args)
-        case "gdb_break":
+        case _:
+            raise ValueError(f"Unknown gdb_session operation: {operation!r}")
+
+
+async def _dispatch_gdb_exec(
+    dbg: Debugger, operation: str, session: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    if operation == "run":
+        return await dbg.run(session=session, **args)
+    if operation == "continue":
+        return await dbg.cont(session=session, **args)
+    if operation == "interrupt":
+        return await dbg.interrupt(session=session)
+    if operation in _GDB_STEP_KINDS:
+        return await dbg.step(operation, session=session, **args)
+    if operation.startswith("reverse-"):
+        return await dbg.reverse(operation[len("reverse-") :], session=session, **args)
+    raise ValueError(f"Unknown gdb_exec operation: {operation!r}")
+
+
+async def _dispatch_gdb_breakpoint(
+    dbg: Debugger, operation: str, session: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    match operation:
+        case "set":
             return await dbg.set_breakpoint(session=session, **args)
-        case "gdb_watch":
+        case "watch":
             return await dbg.set_watchpoint(session=session, **args)
-        case "gdb_breakpoints":
+        case "list":
             return await dbg.list_breakpoints(session=session)
-        case "gdb_delete_breakpoint":
+        case "delete":
             return await dbg.delete_breakpoint(session=session, **args)
-        case "gdb_enable_breakpoint":
-            return await dbg.enable_breakpoint(session=session, **args)
-        case "gdb_modify_breakpoint":
+        case "enable":
+            return await dbg.enable_breakpoint(session=session, enabled=True, **args)
+        case "disable":
+            return await dbg.enable_breakpoint(session=session, enabled=False, **args)
+        case "modify":
             return await dbg.modify_breakpoint(session=session, **args)
-        case "gdb_backtrace":
+        case _:
+            raise ValueError(f"Unknown gdb_breakpoint operation: {operation!r}")
+
+
+async def _dispatch_gdb_inspect(
+    dbg: Debugger, operation: str, session: str, args: dict[str, Any]
+) -> dict[str, Any]:
+    match operation:
+        case "backtrace":
+            if "thread_id" in args:
+                args["thread"] = args.pop("thread_id")
             return await dbg.backtrace(session=session, **args)
-        case "gdb_frame":
+        case "frame":
             return await dbg.select_frame(session=session, **args)
-        case "gdb_eval":
+        case "eval":
             return await dbg.evaluate(session=session, **args)
-        case "gdb_threads":
+        case "threads":
             return await dbg.list_threads(session=session)
-        case "gdb_select_thread":
+        case "select_thread":
             return await dbg.select_thread(session=session, **args)
-        case "gdb_registers":
+        case "registers":
             return await dbg.registers(session=session, **args)
-        case "gdb_memory":
+        case "memory":
             return await dbg.read_memory(session=session, **args)
-        case "gdb_globals":
+        case "globals":
+            if "max_results" in args:
+                args["limit"] = args.pop("max_results")
             return await dbg.list_globals(session=session, **args)
-        case "gdb_disassemble":
+        case "disassemble":
+            if "instruction_count" in args:
+                args["count"] = args.pop("instruction_count")
             return await dbg.disassemble(session=session, **args)
-        case "gdb_source":
+        case "source":
             return await dbg.list_source(session=session, **args)
-        case "gdb_program_output":
+        case "program_output":
             return await dbg.program_output(session=session)
-        case "gdb_raw":
+        case "raw":
             return await dbg.raw(session=session, **args)
         case _:
-            raise ValueError(f"Unknown tool: {name}")
+            raise ValueError(f"Unknown gdb_inspect operation: {operation!r}")
 
 
 async def amain() -> None:

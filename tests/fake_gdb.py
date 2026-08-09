@@ -138,6 +138,27 @@ def main() -> int:
             prompt()
             continue
 
+        if command.startswith("-break-enable"):
+            _breakpoint["enabled"] = "y"
+            emit(f"{token}^done")
+            prompt()
+            continue
+
+        if command.startswith("-break-disable"):
+            _breakpoint["enabled"] = "n"
+            emit(f"{token}^done")
+            prompt()
+            continue
+
+        if command.startswith("-data-disassemble"):
+            emit(
+                f'{token}^done,asm_insns=[{{address="0x40113a",func-name="main",'
+                f'offset="0",inst="mov eax,0x0"}},{{address="0x40113e",'
+                f'func-name="main",offset="4",inst="ret"}}]'
+            )
+            prompt()
+            continue
+
         if command.startswith("-exec-run"):
             emit(f"{token}^running")
             emit('*running,thread-id="all"')
