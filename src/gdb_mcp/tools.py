@@ -696,6 +696,38 @@ class Debugger:
         await gdb.send(f"{verb} {number}")
         return {"breakpoint": number, "enabled": enabled}
 
+    async def modify_breakpoint(
+        self,
+        number: int | str,
+        *,
+        session: str = "default",
+        condition: str | None = None,
+        ignore_count: int | None = None,
+    ) -> dict[str, Any]:
+        """Change an existing breakpoint's condition or ignore count in place.
+
+        Deleting and recreating it to change one field would lose its number
+        and accumulated hit count. `condition=""` clears the condition (MI's
+        `-break-condition NUMBER` with no expression does exactly that);
+        `ignore_count=0` clears the ignore count the same way.
+        """
+        gdb = self.get(session)
+        if condition is None and ignore_count is None:
+            raise ValueError(
+                "Pass condition and/or ignore_count -- nothing to change otherwise."
+            )
+        if condition is not None:
+            await gdb.send(f"-break-condition {int(number)} {condition}".rstrip())
+        if ignore_count is not None:
+            await gdb.send(f"-break-after {int(number)} {int(ignore_count)}")
+
+        result = await gdb.send("-break-list")
+        table = result.payload.get("BreakpointTable", {})
+        for entry in _as_list(table.get("body")):
+            if isinstance(entry, dict) and str(entry.get("number")) == str(number):
+                return {"breakpoint": entry}
+        return {"breakpoint": None, "note": f"breakpoint {number} not found after modification"}
+
     # -- inspection ---------------------------------------------------------
 
     async def backtrace(

@@ -52,6 +52,30 @@ _step_count = 0
 #: other CLI-only command.
 _recording = False
 
+#: The one breakpoint -break-insert creates, mutated in place by
+#: -break-condition / -break-after so -break-list can reflect edits --
+#: needed to exercise gdb_modify_breakpoint without a real gdb.
+_breakpoint: dict[str, str] = {}
+
+
+def _reset_breakpoint() -> None:
+    _breakpoint.clear()
+    _breakpoint.update(
+        number="1",
+        type="breakpoint",
+        disp="keep",
+        enabled="y",
+        addr="0x40113a",
+        func="main",
+        file="t.c",
+        line="5",
+        times="0",
+    )
+
+
+def _format_bkpt(fields: dict) -> str:
+    return ",".join(f'{k}="{v}"' for k, v in fields.items())
+
 
 def main() -> int:
     global _step_count, _recording
@@ -83,11 +107,34 @@ def main() -> int:
             continue
 
         if command.startswith("-break-insert"):
-            emit(
-                f'{token}^done,bkpt={{number="1",type="breakpoint",disp="keep",'
-                f'enabled="y",addr="0x40113a",func="main",file="t.c",line="5",'
-                f'times="0"}}'
-            )
+            _reset_breakpoint()
+            emit(f"{token}^done,bkpt={{{_format_bkpt(_breakpoint)}}}")
+            prompt()
+            continue
+
+        if command.startswith("-break-condition"):
+            # "-break-condition NUMBER EXPR..." or bare "-break-condition NUMBER"
+            rest = command[len("-break-condition") :].strip().split(" ", 1)
+            expr = rest[1] if len(rest) > 1 else ""
+            if expr:
+                _breakpoint["cond"] = expr
+            else:
+                _breakpoint.pop("cond", None)
+            emit(f"{token}^done")
+            prompt()
+            continue
+
+        if command.startswith("-break-after"):
+            parts = command[len("-break-after") :].strip().split()
+            if len(parts) >= 2:
+                _breakpoint["ignore"] = parts[1]
+            emit(f"{token}^done")
+            prompt()
+            continue
+
+        if command.startswith("-break-list"):
+            body = f"bkpt={{{_format_bkpt(_breakpoint)}}}" if _breakpoint else ""
+            emit(f'{token}^done,BreakpointTable={{nr_rows="1",body=[{body}]}}')
             prompt()
             continue
 
