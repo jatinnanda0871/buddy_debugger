@@ -95,6 +95,33 @@ async def test_conditional_breakpoint_is_accepted(debugger, target_binary):
     assert result["breakpoint"].get("cond") == "limit > 0"
 
 
+async def test_modify_breakpoint_sets_condition_without_changing_its_number(
+    debugger, target_binary
+):
+    await debugger.start(binary=target_binary)
+    inserted = await debugger.set_breakpoint("parse_header")
+    number = inserted["breakpoint"]["number"]
+
+    result = await debugger.modify_breakpoint(number, condition="limit > 0")
+    assert result["breakpoint"]["number"] == number
+    assert result["breakpoint"]["cond"] == "limit > 0"
+
+
+async def test_modify_breakpoint_ignore_count_then_clearing_both(debugger, target_binary):
+    await debugger.start(binary=target_binary)
+    inserted = await debugger.set_breakpoint("parse_header")
+    number = inserted["breakpoint"]["number"]
+    await debugger.modify_breakpoint(number, condition="limit > 0")
+
+    with_ignore = await debugger.modify_breakpoint(number, ignore_count=3)
+    assert with_ignore["breakpoint"]["ignore"] == "3"
+    assert with_ignore["breakpoint"]["cond"] == "limit > 0"  # untouched
+
+    cleared = await debugger.modify_breakpoint(number, condition="", ignore_count=0)
+    assert "cond" not in cleared["breakpoint"]
+    assert "ignore" not in cleared["breakpoint"]
+
+
 # -- stack --------------------------------------------------------------------
 
 
@@ -271,6 +298,46 @@ async def test_draining_output_twice_explains_the_empty_result(
     drained = await stopped_in_parse_header.program_output()
     assert drained["output"] == ""
     assert "delivered" in drained["note"]
+
+
+# -- reverse debugging ---------------------------------------------------------
+
+
+async def test_reverse_without_recording_gives_a_clear_error(stopped_in_parse_header):
+    """The fake proves the wrapping logic; this proves real gdb actually
+    raises on a bare `--reverse` and that the wrapped message still matches."""
+    from gdb_mcp.session import GdbError
+
+    with pytest.raises(GdbError, match="gdb_record"):
+        await stopped_in_parse_header.reverse(kind="step")
+
+
+async def test_reverse_step_undoes_forward_steps(stopped_in_parse_header):
+    """Step forward through parse_header's loop, then step the same distance
+    backward -- a real process-record round trip, not just protocol shape.
+
+    Recording starts only *after* stepping past the `strlen(raw)` call on the
+    breakpoint line: gdb's software record-full target single-steps through
+    everything, including callees, and stepping into glibc's vectorized
+    __strlen_evex under recording is pathologically slow -- confirmed by
+    hand (60s+ per step, never finishing) against real gdb 15.1. Recording
+    only the plain loop body avoids that entirely and each step is
+    sub-10ms. This is a real gdb/record-full limitation, not something this
+    project can paper over -- see the README caveat next to gdb_record.
+    """
+    debugger = stopped_in_parse_header
+    past_strlen = await debugger.step(kind="next", timeout=30)
+    assert past_strlen["state"] == "stopped"
+    start_line = past_strlen["frame"]["line"]
+
+    await debugger.record(action="start")
+    forward = await debugger.step(kind="next", count=3, timeout=30)
+    assert forward["state"] == "stopped"
+    assert forward["frame"]["line"] != start_line
+
+    back = await debugger.reverse(kind="step", count=3, timeout=30)
+    assert back["state"] == "stopped"
+    assert back["frame"]["line"] == start_line
 
 
 # -- crashes and core dumps ---------------------------------------------------
