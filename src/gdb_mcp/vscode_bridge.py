@@ -565,7 +565,7 @@ class VSCodeDebugger:
                 "line": top.get("line"),
             }
         }
-        ctx = source_context(source, top.get("line"))
+        ctx = await asyncio.to_thread(source_context, source, top.get("line"))
         if ctx:
             out["source"] = ctx
         return out
