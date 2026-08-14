@@ -52,9 +52,13 @@ run **GDB MCP Bridge: Show Status** to confirm. See
 [vscode-extension/README.md](vscode-extension/README.md) for the HTTP contract
 and security model.
 
-`GDB_MCP_TOOLS` trims the 48-tool surface if that's too much for your model to
-choose between: `vscode` exposes only `vsc_*`, `gdb` only `gdb_*`, `all`
-(default) exposes both.
+The surface is 7 dispatcher tools, not one per operation: `gdb_session` /
+`gdb_exec` / `gdb_breakpoint` / `gdb_inspect` cover the standalone-GDB
+backend, `vsc_session` / `vsc_exec` / `vsc_inspect` cover the VS Code bridge.
+Each takes an `operation` field (e.g. `gdb_exec(operation="step")`) plus that
+operation's own arguments — see [Tools](#tools) below for the full list.
+`GDB_MCP_TOOLS` still trims the surface: `vscode` exposes only `vsc_*`, `gdb`
+only `gdb_*`, `all` (default) exposes both.
 
 ## Running it
 
@@ -91,95 +95,85 @@ You launched with F5 and you're sitting at a breakpoint or a crash. Ask the
 agent for help; it works on *your* live session, no relaunch, no reproduction:
 
 ```
-vsc_status          → stopped, reason, frame, surrounding source
-vsc_backtrace       → call stack with frame ids
-vsc_frame(id)       → locals and args, structs expanded one level
-vsc_eval("hdr->len")
-vsc_exec("thread apply all bt")     ← raw gdb, via cppdbg's -exec
+vsc_session(operation="status")                        → stopped, reason, frame, surrounding source
+vsc_inspect(operation="backtrace")                      → call stack with frame ids
+vsc_inspect(operation="frame", frame_id=id)             → locals and args, structs expanded one level
+vsc_inspect(operation="eval", expression="hdr->len")
+vsc_inspect(operation="raw", command="thread apply all bt")   ← raw gdb, via cppdbg's -exec
 ```
 
 Nothing here disturbs your session — you keep your breakpoints and your place.
 
 ### 2. The agent made a change and wants to verify the fix
 
-The agent presses F5 for you. `vsc_launch` calls
+The agent presses F5 for you. `vsc_session(operation="launch")` calls
 `vscode.debug.startDebugging`, which is the *same code path* as the F5 key — so
 your `preLaunchTask` (the build), your `envFile`, your args and `cwd` all apply
 exactly as configured. No re-implementation of `${workspaceFolder}` resolution
 that could drift from what VS Code actually does.
 
 ```
-vsc_configs                          → list launch.json configurations
-vsc_set_breakpoints([{file, line}])  → appear in your editor gutter
-vsc_launch("Debug my app")           → builds, launches, waits for first stop
-vsc_continue / vsc_step / vsc_output
-vsc_terminate
+vsc_session(operation="configs")                                  → list launch.json configurations
+vsc_inspect(operation="set_breakpoints", breakpoints=[{file, line}])  → appear in your editor gutter
+vsc_session(operation="launch", name="Debug my app")               → builds, launches, waits for first stop
+vsc_exec(operation="continue") / vsc_exec(operation="step") / vsc_inspect(operation="output")
+vsc_session(operation="terminate")
 ```
 
 ## Tools
 
-### VS Code session (`vsc_*`)
-
-| Tool | Purpose |
-| --- | --- |
-| `vsc_status` | **Start here.** Session active? stopped? current frame + source |
-| `vsc_configs` / `vsc_launch` / `vsc_terminate` | List and run launch.json configs |
-| `vsc_continue` / `vsc_step` / `vsc_pause` / `vsc_wait_stop` | Execution control |
-| `vsc_backtrace` / `vsc_frame` / `vsc_eval` | Stack, locals + args, expressions |
-| `vsc_globals` | **Enumerate globals** — `vsc_frame` shows only locals |
-| `vsc_threads` | Threads |
-| `vsc_breakpoints` / `vsc_set_breakpoints` | Breakpoints, visible in the editor |
-| `vsc_output` | Drain the program's stdout/stderr |
-| `vsc_memory` | Address-range dump in hex words with an ASCII gutter |
-| `vsc_disassemble` | Disassembly at a `pc` |
-| `vsc_exec` | Escape hatch: raw GDB command via `-exec` |
+7 dispatcher tools, each taking an `operation` field plus that operation's
+own arguments — e.g. `gdb_exec(operation="step", kind="next")`. Grouped by
+what they do, not by original tool count: session lifecycle, execution
+control, breakpoint management, and read-only inspection are different
+enough in shape that folding them into fewer tools would just make both the
+code and the model's job harder. Every `gdb_*` tool also takes `session` (see
+above); `vsc_*` tools don't, since there's only one VS Code session.
 
 ### Standalone GDB (`gdb_*`)
 
-| Tool | Purpose |
-| --- | --- |
-| `gdb_start` / `gdb_stop` | Open/close a session; `gdb_stop` **detaches** by default |
-| `gdb_status` | Where am I: running or stopped, frame, source context |
-| `gdb_attach` | Attach to a live PID (**stops that process**) |
-| `gdb_load_core` | Post-mortem on a core dump; returns the crash backtrace |
-| `gdb_run` / `gdb_continue` / `gdb_step` / `gdb_interrupt` | Execution control |
-| `gdb_record` / `gdb_reverse` | Record execution, then run it backward |
-| `gdb_break` / `gdb_watch` / `gdb_breakpoints` / `gdb_delete_breakpoint` | Breakpoints |
-| `gdb_enable_breakpoint` | Enable/disable a breakpoint without deleting it |
-| `gdb_modify_breakpoint` | Change a breakpoint's condition/ignore count without deleting it |
-| `gdb_backtrace` / `gdb_frame` / `gdb_eval` | Stack, locals + args, expressions |
-| `gdb_globals` | **Enumerate globals** with types and optional values |
-| `gdb_threads` / `gdb_select_thread` | Threads |
-| `gdb_memory` | Address-range dump in hex words with an ASCII gutter |
-| `gdb_registers` / `gdb_disassemble` / `gdb_source` | Low-level inspection |
-| `gdb_program_output` | Drain the inferior's stdout/stderr |
-| `gdb_raw` | Escape hatch: any GDB CLI command |
+| Tool | `operation` values | Purpose |
+| --- | --- | --- |
+| `gdb_session` | `start`, `stop`, `status`, `attach`, `load_core`, `record` | Open/close a session (`stop` **detaches** by default); where am I; attach to a live PID (**stops that process**); post-mortem on a core dump; start/stop execution recording |
+| `gdb_exec` | `run`, `continue`, `interrupt`, `step`, `next`, `finish`, `stepi`, `nexti`, `until`, `return`, `reverse-continue`, `reverse-step`, `reverse-next`, `reverse-finish` | Execution control, forward and backward (reverse requires `gdb_session(operation="record")` first) |
+| `gdb_breakpoint` | `set`, `watch`, `list`, `delete`, `enable`, `disable`, `modify` | Create, list, or edit breakpoints/watchpoints — `modify`/`enable`/`disable` act on an existing breakpoint without deleting it |
+| `gdb_inspect` | `backtrace`, `frame`, `eval`, `threads`, `select_thread`, `registers`, `memory`, `globals`, `disassemble`, `source`, `program_output`, `raw` | Stack, locals + args, expressions, threads, registers, an address-range hex dump, **global variables** (`frame` shows only locals), disassembly, source, captured stdout/stderr, and a raw-GDB-command escape hatch |
+
+### VS Code session (`vsc_*`)
+
+| Tool | `operation` values | Purpose |
+| --- | --- | --- |
+| `vsc_session` | `status`, `configs`, `launch`, `terminate` | **`status` is the preferred first call.** List and run launch.json configs |
+| `vsc_exec` | `continue`, `next`, `step`, `stepIn`, `stepOut`, `finish`, `pause`, `wait_stop` | Execution control |
+| `vsc_inspect` | `threads`, `backtrace`, `frame`, `eval`, `breakpoints`, `set_breakpoints`, `output`, `disassemble`, `memory`, `globals`, `raw` | Stack, locals + args, expressions, threads, breakpoints (visible in the editor), captured stdout/stderr, an address-range hex dump, **global variables** (`frame` shows only locals), and a raw-GDB-command escape hatch via cppdbg's `-exec` |
 
 ## Globals and memory ranges
 
-**Globals are not locals.** `gdb_frame` / `vsc_frame` use
-`-stack-list-variables` and DAP `scopes`, which return *only* locals and
-arguments — globals are invisible there. `gdb_globals` enumerates them from the
-symbol table:
+**Globals are not locals.** `gdb_inspect(operation="frame")` /
+`vsc_inspect(operation="frame")` use `-stack-list-variables` and DAP `scopes`,
+which return *only* locals and arguments — globals are invisible there.
+`operation="globals"` enumerates them from the symbol table instead:
 
 ```
-gdb_globals(pattern="g_conn", include_values=true)
+gdb_inspect(operation="globals", pattern="g_conn", include_values=true)
   → [{name: "g_connection_count", type: "int", file: "src/server.c",
       line: 12, value: "17"}, …]
 ```
 
 Always pass a `pattern` regex — without one you get every global in every linked
 library, thousands of symbols. File-scope statics with colliding names need
-qualification: `gdb_eval("'server.c'::g_config")`.
+qualification: `gdb_inspect(operation="eval", expression="'server.c'::g_config")`.
 
-On the VS Code side, DAP has no symbol-listing request, so `vsc_globals` routes
-through `-exec info variables` and parses the result.
+On the VS Code side, DAP has no symbol-listing request, so
+`vsc_inspect(operation="globals")` routes through `-exec info variables` and
+parses the result.
 
-**Memory ranges.** One tool per backend, always hex. `gdb_memory` reads `count`
-words of `word_size` bytes, with an ASCII gutter alongside:
+**Memory ranges.** One operation per backend, always hex.
+`gdb_inspect(operation="memory")` reads `count` words of `word_size` bytes,
+with an ASCII gutter alongside:
 
 ```
-gdb_memory("$sp", count=8)
+gdb_inspect(operation="memory", address="$sp", count=8)
 0x00007ffd0000  0x00007ffff7a2d0b0  0x0000000000000001  |................|
 0x00007ffd0010  0x00005555555551a9  0x0000000000000000  |.QUUUU..........|
 ```
@@ -188,15 +182,16 @@ gdb_memory("$sp", count=8)
 (the default, and what pointers are on x86-64). A word is the smallest unit;
 there is no byte or halfword view. Rows are 16 bytes wide either way.
 
-`vsc_memory` is the same tool against the VS Code session, and additionally
-accepts expressions (`&buf`, `pkt->payload`) rather than only raw addresses — it
-evaluates them to an address first. It renders the same rows, not the base64
-blob DAP actually carries.
+`vsc_inspect(operation="memory")` is the same operation against the VS Code
+session, and additionally accepts expressions (`&buf`, `pkt->payload`) rather
+than only raw addresses — it evaluates them to an address first. It renders
+the same rows, not the base64 blob DAP actually carries.
 
 **Everything else is hex too.** Both backends set `set output-radix 16`, so
 evaluated expressions, locals and register values print in hex and agree with
-the memory dumps rather than mixing radices — `gdb_eval` and `vsc_eval` return
-`0x11` for the same variable, not `0x11` and `17`.
+the memory dumps rather than mixing radices — `gdb_inspect(operation="eval")`
+and `vsc_inspect(operation="eval")` return `0x11` for the same variable, not
+`0x11` and `17`.
 
 For `vsc_*` this is applied once per GDB-backed session, which also changes
 what **your** Variables pane and hover tooltips show, since it is your session.
@@ -217,15 +212,15 @@ hand the model a stale, wrong view of the world.
 Both backends therefore wait for the *real* stop — GDB/MI via a stop queue, DAP
 via long-polling `/events` from a sequence cursor captured before the resume (so
 a stop from a previous run can't satisfy the current wait). On timeout both
-return `state: "running"` pointing at `gdb_interrupt` / `vsc_pause`. Neither
-ever fabricates a stop.
+return `state: "running"` pointing at `gdb_exec(operation="interrupt")` /
+`vsc_exec(operation="pause")`. Neither ever fabricates a stop.
 
 **Stops answer the whole question at once.** Every stop returns reason, thread,
 breakpoint number, frame, *and* the surrounding source lines, so the model needs
 one call rather than four to know where it is.
 
-**Locals are diffed, not re-sent.** `gdb_run` / `gdb_continue` / `gdb_step` and
-their `vsc_*` equivalents fold the current frame's locals into the stop result.
+**Locals are diffed, not re-sent.** Every `gdb_exec` operation and its
+`vsc_exec` equivalents fold the current frame's locals into the stop result.
 The first stop in a scope returns all of them, under `variables`; every
 subsequent stop in the *same* scope (same function) instead returns
 `changed_variables` — only the ones whose value moved, plus an
@@ -236,7 +231,8 @@ baseline and returns the full list again.
 **The inferior gets its own pty.** On a native Linux target the debugged program
 shares GDB's terminal, so its `printf` output lands in the middle of the MI
 stream and corrupts parsing. The session allocates a pty, points
-`inferior-tty` at it, and buffers that output for `gdb_program_output`.
+`inferior-tty` at it, and buffers that output for
+`gdb_inspect(operation="program_output")`.
 
 Also: `pagination off` at startup (otherwise GDB blocks forever on
 `---Type <return> to continue---`), `-nx` by default for reproducibility (pass
@@ -247,37 +243,45 @@ and an MI-version fallback to `mi2` for GDB older than 8.1.
 
 The defaults assume you may point this at something you care about.
 
-- **`gdb_eval` blocks inferior function calls.** In GDB, `print some_func()`
-  really executes that function inside the target process. On a process you
-  attached to in production, that is a live side effect. Set
-  `allow_function_calls=true` to opt in per call.
-- **`gdb_stop` detaches, it doesn't kill.** Pass `kill=true` deliberately.
-- **`gdb_attach` freezes the target** until you continue it. On a production
-  service that is downtime — an agent should be told so in its system prompt.
-- **`gdb_record` has real overhead.** Process record-and-replay slows
-  execution and its memory cost grows with how long it runs — start it only
-  when you actually need `gdb_reverse`, and stop it when you're done. It is
-  `gdb_*`-only: there is no `vsc_record`, since DAP's reverse-debugging
-  requests aren't reliably supported by the adapters this project targets. A
-  GDB-backed `vsc_*` session can still reach the same underlying commands via
-  `vsc_exec("record")` / `vsc_exec("reverse-step")`, just without the
+- **`gdb_inspect(operation="eval")` blocks inferior function calls.** In GDB,
+  `print some_func()` really executes that function inside the target
+  process. On a process you attached to in production, that is a live side
+  effect. Set `allow_function_calls=true` to opt in per call.
+- **`gdb_session(operation="stop")` detaches, it doesn't kill.** Pass
+  `kill=true` deliberately.
+- **`gdb_session(operation="attach")` freezes the target** until you continue
+  it. On a production service that is downtime — an agent should be told so
+  in its system prompt.
+- **`gdb_session(operation="record")` has real overhead.** Process
+  record-and-replay slows execution and its memory cost grows with how long
+  it runs — start it only when you actually need `gdb_exec`'s `reverse-*`
+  operations, and stop it when you're done. It is `gdb_*`-only: there is no
+  `vsc_*` equivalent, since DAP's reverse-debugging requests aren't reliably
+  supported by the adapters this project targets. A GDB-backed `vsc_*`
+  session can still reach the same underlying commands via
+  `vsc_inspect(operation="raw", command="record")` /
+  `vsc_inspect(operation="raw", command="reverse-step")`, just without the
   structured stop result.
-- **`gdb_step`/`gdb_reverse` can hang for minutes if you step over a call
-  into code with no line info** (a vectorized libc routine like `strlen` is
-  the common case) while recording is active. GDB's `record full` target
-  single-steps and snapshots *every instruction*, including inside the
+- **`gdb_exec`'s step/reverse operations can hang for minutes if you step
+  over a call into code with no line info** (a vectorized libc routine like
+  `strlen` is the common case) while recording is active. GDB's `record full`
+  target single-steps and snapshots *every instruction*, including inside the
   callee, and optimized SIMD implementations can take real gdb minutes to
   single-step through this way — confirmed by hand against gdb 15.1, where a
   single `next` over one `strlen()` call never returned within 60s. Step past
-  such calls *before* calling `gdb_record(action="start")`, not after.
-- **`gdb_raw` and `vsc_exec` are unrestricted.** Both reach `shell`, `set var`,
-  `call`. Drop them from the list if you want a read-only posture.
+  such calls *before* calling `gdb_session(operation="record", action="start")`,
+  not after.
+- **`gdb_inspect(operation="raw")` and `vsc_inspect(operation="raw")` are
+  unrestricted.** Both reach `shell`, `set var`, `call`. Drop `gdb_inspect` /
+  `vsc_inspect` from the list if you want a read-only posture — note this also
+  drops the rest of their read-only operations, since `raw` isn't split out
+  into its own tool.
 - **The bridge socket is `0600`** in your `$TMPDIR`, with a fresh 32-byte token
   per activation, so other users on a shared box cannot connect.
 
 Anyone who can call these tools can read all memory of the target process
-(credentials, keys, customer data) and, via `gdb_raw` / `vsc_exec`, run commands
-as your user. Run it as an unprivileged user scoped to what it should debug.
+(credentials, keys, customer data) and, via `operation="raw"`, run commands as
+your user. Run it as an unprivileged user scoped to what it should debug.
 
 ## Linux setup gotchas
 
@@ -309,8 +313,8 @@ coredumpctl dump <pid> --output=/tmp/core.1234
 
 **Symbols** — build with `-g`. For system libraries install the matching
 `-dbg`/`-debuginfo` packages, or point GDB at a symbol store with
-`gdb_raw("set debug-file-directory /path/to/debug")`. Without them backtraces
-are just addresses and the model will guess.
+`gdb_inspect(operation="raw", command="set debug-file-directory /path/to/debug")`.
+Without them backtraces are just addresses and the model will guess.
 
 ## Tests
 
@@ -346,8 +350,8 @@ GDB_MCP_LIVE_BRIDGE=1 pytest tests/live/
 ```
 
 The cppdbg file is the one that matters for C++: it is the only place
-`vsc_exec`, `vsc_globals`, `vsc_memory` and `vsc_disassemble` do real work
-(debugpy can only prove they refuse cleanly). On Linux it builds and debugs
+`vsc_inspect`'s `raw`, `globals`, `memory` and `disassemble` operations do
+real work (debugpy can only prove they refuse cleanly). On Linux it builds and debugs
 locally; on Windows it builds in WSL and reaches it through cppdbg's
 `pipeTransport`, so gdb runs on Linux while VS Code stays on Windows. Point
 `GDB_MCP_CPP_PROGRAM` at a prebuilt binary to skip the build, and
