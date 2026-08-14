@@ -89,6 +89,16 @@ async def test_successful_call_does_not_set_is_error(tmp_path, monkeypatch):
         assert payload(result)["status"] == "no such session"
 
 
+async def test_enable_breakpoint_tool_is_wired(tmp_path, monkeypatch):
+    """Debugger.enable_breakpoint exists but was never registered as a tool --
+    this pins that gdb_enable_breakpoint reaches the same session lookup every
+    other gdb_* tool does, not a fallthrough 'Unknown tool' error."""
+    async with connected(tmp_path, monkeypatch) as client:
+        result = await client.call_tool("gdb_enable_breakpoint", {"number": 1})
+        assert result.isError is True
+        assert "No active GDB session" in payload(result)["error"]
+
+
 async def test_unknown_tool_sets_is_error(tmp_path, monkeypatch):
     async with connected(tmp_path, monkeypatch) as client:
         result = await client.call_tool("gdb_not_a_tool", {})

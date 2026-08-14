@@ -186,6 +186,21 @@ TOOLS: list[Tool] = [
         inputSchema=_schema({"number": {"type": "integer"}}, ["number"]),
     ),
     Tool(
+        name="gdb_enable_breakpoint",
+        description="Enable or disable a breakpoint by number, without deleting it.",
+        inputSchema=_schema(
+            {
+                "number": {"type": "integer"},
+                "enabled": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "false disables the breakpoint instead of enabling it.",
+                },
+            },
+            ["number"],
+        ),
+    ),
+    Tool(
         name="gdb_backtrace",
         description="Show the call stack of the current (or given) thread.",
         inputSchema=_schema(
@@ -562,7 +577,7 @@ ALL_TOOLS = VSCODE_TOOLS + TOOLS
 def select_tools(which: str = "all") -> list[Tool]:
     """Trim the exposed surface.
 
-    42 tools is a lot for a model to choose between. If you only ever debug
+    45 tools is a lot for a model to choose between. If you only ever debug
     through VS Code, set GDB_MCP_TOOLS=vscode and the standalone GDB tools
     disappear (and vice versa for headless core-dump work).
     """
@@ -702,6 +717,8 @@ async def _dispatch(
             return await dbg.list_breakpoints(session=session)
         case "gdb_delete_breakpoint":
             return await dbg.delete_breakpoint(session=session, **args)
+        case "gdb_enable_breakpoint":
+            return await dbg.enable_breakpoint(session=session, **args)
         case "gdb_backtrace":
             return await dbg.backtrace(session=session, **args)
         case "gdb_frame":

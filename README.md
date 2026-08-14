@@ -52,7 +52,7 @@ run **GDB MCP Bridge: Show Status** to confirm. See
 [vscode-extension/README.md](vscode-extension/README.md) for the HTTP contract
 and security model.
 
-`GDB_MCP_TOOLS` trims the 44-tool surface if that's too much for your model to
+`GDB_MCP_TOOLS` trims the 45-tool surface if that's too much for your model to
 choose between: `vscode` exposes only `vsc_*`, `gdb` only `gdb_*`, `all`
 (default) exposes both.
 
@@ -144,6 +144,7 @@ vsc_terminate
 | `gdb_load_core` | Post-mortem on a core dump; returns the crash backtrace |
 | `gdb_run` / `gdb_continue` / `gdb_step` / `gdb_interrupt` | Execution control |
 | `gdb_break` / `gdb_watch` / `gdb_breakpoints` / `gdb_delete_breakpoint` | Breakpoints |
+| `gdb_enable_breakpoint` | Enable/disable a breakpoint without deleting it |
 | `gdb_backtrace` / `gdb_frame` / `gdb_eval` | Stack, locals + args, expressions |
 | `gdb_globals` | **Enumerate globals** with types and optional values |
 | `gdb_threads` / `gdb_select_thread` | Threads |
