@@ -320,6 +320,11 @@ class VSCodeDebugger:
         self.hex_output = hex_output
         self._hex_configured: set[str] = set()
         self._client: BridgeClient | None = None
+        # Locals snapshot from the previous stop, keyed by (session id, frame
+        # name) so a scope change or a different session starts fresh. The
+        # DAP-side twin of the gdb_* backend's locals diffing.
+        self._locals_baseline: dict[str, Any] | None = None
+        self._locals_baseline_key: tuple[Any, Any] | None = None
 
     def client(self, *, refresh: bool = False) -> BridgeClient:
         if self._client is None or refresh:
@@ -502,6 +507,8 @@ class VSCodeDebugger:
 
         kind = event.get("type")
         if kind in ("exited", "terminated"):
+            self._locals_baseline = None
+            self._locals_baseline_key = None
             out = {"state": kind}
             if kind == "exited":
                 out["exit_code"] = event.get("exitCode")
@@ -522,7 +529,62 @@ class VSCodeDebugger:
         if thread_id is not None:
             out["thread_id"] = thread_id
             out.update(await self._frame_summary(thread_id))
+            frame = out.get("frame") or {}
+            diff = await self._diff_locals(frame.get("id"), frame.get("name"))
+            if diff:
+                out.update(diff)
         await self._fold_in_output(out)
+        return out
+
+    async def _diff_locals(
+        self, frame_id: int | None, scope_key: Any
+    ) -> dict[str, Any] | None:
+        """Report only the Locals-scope variables that changed since the
+        previous stop -- the DAP-side twin of the gdb_* backend's diffing.
+
+        Best-effort: any DAP failure here (no `scopes` support, no Locals
+        scope, an adapter that rejects the request) must not cost the caller
+        the rest of the stop report, so failures return None rather than
+        raise.
+        """
+        if frame_id is None:
+            return None
+        try:
+            scopes_result = await self._dap("scopes", {"frameId": frame_id})
+            locals_scope = next(
+                (
+                    s
+                    for s in (scopes_result or {}).get("scopes", [])
+                    if not s.get("expensive")
+                    and (s.get("name") or "").lower() == "locals"
+                ),
+                None,
+            )
+            if locals_scope is None:
+                return None
+            variables = await self._variables(
+                locals_scope.get("variablesReference", 0), depth=0, max_children=200
+            )
+            session = await self._active_session()
+        except BridgeError:
+            return None
+
+        current = {v["name"]: v.get("value") for v in variables if v.get("name")}
+        key = ((session or {}).get("id"), scope_key)
+        baseline, same_scope = self._locals_baseline, self._locals_baseline_key == key
+        self._locals_baseline, self._locals_baseline_key = current, key
+
+        if baseline is None or not same_scope:
+            return {"variables": variables}
+
+        changed = [
+            {"name": name, "old": baseline.get(name), "new": value}
+            for name, value in current.items()
+            if baseline.get(name) != value
+        ]
+        out: dict[str, Any] = {"changed_variables": changed}
+        if len(current) > len(changed):
+            out["unchanged_count"] = len(current) - len(changed)
         return out
 
     # -- inspection ---------------------------------------------------------

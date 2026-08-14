@@ -507,9 +507,60 @@ class Debugger:
 
     async def _exec_result(self, gdb: GdbSession, stop: StopEvent | None) -> dict[str, Any]:
         out = await describe_stop(stop, running=gdb.running)
+        diff = await self._diff_locals(gdb, stop)
+        if diff:
+            out.update(diff)
         output = gdb.read_program_output()
         if output:
             out["program_output"] = truncate(output, 4000)
+        return out
+
+    async def _diff_locals(
+        self, gdb: GdbSession, stop: StopEvent | None
+    ) -> dict[str, Any] | None:
+        """Report only the locals that changed since the previous stop.
+
+        The frame already answers "where am I" on every stop; the full locals
+        list on top of that answers "what does everything look like" -- which
+        is mostly unchanged values on every iteration of a tight step loop.
+        Diffing against the previous stop's snapshot keeps that answer small
+        without losing it: the first stop in a scope (or after a scope change)
+        still returns everything, since there is nothing to diff against yet.
+        """
+        if stop is None or stop.exited:
+            gdb.locals_baseline = None
+            gdb.locals_baseline_scope = None
+            return None
+
+        frame = stop.payload.get("frame")
+        scope = frame.get("func") if isinstance(frame, dict) else None
+        try:
+            result = await gdb.send("-stack-list-variables --simple-values")
+        except GdbError:
+            return None
+        variables = _as_list(result.payload.get("variables"))
+        current = {
+            v.get("name"): v.get("value")
+            for v in variables
+            if isinstance(v, dict) and v.get("name")
+        }
+
+        baseline = gdb.locals_baseline
+        same_scope = gdb.locals_baseline_scope == scope
+        gdb.locals_baseline = current
+        gdb.locals_baseline_scope = scope
+
+        if baseline is None or not same_scope:
+            return {"variables": variables}
+
+        changed = [
+            {"name": name, "old": baseline.get(name), "new": value}
+            for name, value in current.items()
+            if baseline.get(name) != value
+        ]
+        out: dict[str, Any] = {"changed_variables": changed}
+        if len(current) > len(changed):
+            out["unchanged_count"] = len(current) - len(changed)
         return out
 
     # -- breakpoints --------------------------------------------------------

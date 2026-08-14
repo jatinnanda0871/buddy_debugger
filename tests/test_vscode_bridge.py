@@ -491,3 +491,93 @@ async def test_hex_output_can_be_switched_off(bridge):
     await plain.evaluate("g_connection_count")
     sent = [args["expression"] for name, args in bridge.dap_calls if name == "evaluate"]
     assert not any("output-radix" in expr for expr in sent), sent
+
+
+# -- locals diffing -------------------------------------------------------
+
+
+async def test_first_stop_returns_the_full_locals_scope(bridge, debugger):
+    bridge.add_session()
+    bridge.set_stopped(thread_id=1)
+    bridge.dap_responses["continue"] = {"allThreadsContinued": True}
+    bridge.dap_responses["stackTrace"] = {
+        "stackFrames": [{"id": 5, "name": "loop", "source": {}, "line": 10}]
+    }
+    bridge.dap_responses["scopes"] = {
+        "scopes": [{"name": "Locals", "variablesReference": 10, "expensive": False}]
+    }
+    bridge.dap_responses["variables"] = lambda args: {
+        "variables": [{"name": "i", "value": "0"}, {"name": "total", "value": "42"}]
+    }
+
+    async def stop_later():
+        await asyncio.sleep(0.05)
+        bridge.set_stopped(reason="breakpoint", thread_id=1)
+
+    task = asyncio.create_task(stop_later())
+    result = await debugger.resume("continue", timeout=5)
+    await task
+
+    assert result["variables"] == [
+        {"name": "i", "value": "0"},
+        {"name": "total", "value": "42"},
+    ]
+    assert "changed_variables" not in result
+
+
+async def test_second_stop_in_the_same_frame_reports_only_the_diff(bridge, debugger):
+    """The DAP-side twin of the gdb_* backend's diffing: same idea, over
+    scopes/variables instead of -stack-list-variables."""
+    bridge.add_session()
+    bridge.set_stopped(thread_id=1)
+    bridge.dap_responses["continue"] = {"allThreadsContinued": True}
+    bridge.dap_responses["stackTrace"] = {
+        "stackFrames": [{"id": 5, "name": "loop", "source": {}, "line": 10}]
+    }
+    bridge.dap_responses["scopes"] = {
+        "scopes": [{"name": "Locals", "variablesReference": 10, "expensive": False}]
+    }
+    state = {"i": "0"}
+    bridge.dap_responses["variables"] = lambda args: {
+        "variables": [{"name": "i", "value": state["i"]}, {"name": "total", "value": "42"}]
+    }
+
+    async def stop_later(reason):
+        await asyncio.sleep(0.05)
+        bridge.set_stopped(reason=reason, thread_id=1)
+
+    task = asyncio.create_task(stop_later("breakpoint"))
+    await debugger.resume("continue", timeout=5)
+    await task
+
+    state["i"] = "1"
+    task = asyncio.create_task(stop_later("step"))
+    result = await debugger.resume("continue", timeout=5)
+    await task
+
+    assert result["changed_variables"] == [{"name": "i", "old": "0", "new": "1"}]
+    assert result["unchanged_count"] == 1
+    assert "variables" not in result
+
+
+async def test_missing_scopes_support_does_not_break_the_stop_report(bridge, debugger):
+    """Adapters/tests that never script `scopes` must still get a clean stop,
+    not a BridgeError bubbling up from the (best-effort) diffing step."""
+    bridge.add_session()
+    bridge.set_stopped(thread_id=1)
+    bridge.dap_responses["continue"] = {"allThreadsContinued": True}
+    bridge.dap_responses["stackTrace"] = {
+        "stackFrames": [{"id": 5, "name": "loop", "source": {}, "line": 10}]
+    }
+
+    async def stop_later():
+        await asyncio.sleep(0.05)
+        bridge.set_stopped(reason="breakpoint", thread_id=1)
+
+    task = asyncio.create_task(stop_later())
+    result = await debugger.resume("continue", timeout=5)
+    await task
+
+    assert result["state"] == "stopped"
+    assert "variables" not in result
+    assert "changed_variables" not in result

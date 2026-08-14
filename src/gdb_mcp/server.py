@@ -132,7 +132,10 @@ TOOLS: list[Tool] = [
         name="gdb_step",
         description=(
             "Single-step. kind: step (into), next (over), finish (out of frame), "
-            "stepi/nexti (instruction), until, return."
+            "stepi/nexti (instruction), until, return. The result carries the "
+            "current frame's locals: `variables` (full list) on the first stop "
+            "in a function, `changed_variables` (diff against the previous "
+            "stop) on every later one in the same function."
         ),
         inputSchema=_schema(
             {
@@ -391,7 +394,12 @@ VSCODE_TOOLS: list[Tool] = [
     ),
     Tool(
         name="vsc_step",
-        description="Step the program: next (over), step (into), stepOut (finish frame).",
+        description=(
+            "Step the program: next (over), step (into), stepOut (finish frame). "
+            "The result carries the current frame's locals: `variables` (full "
+            "list) on the first stop in a function, `changed_variables` (diff "
+            "against the previous stop) on every later one in the same function."
+        ),
         inputSchema=_vsc(
             {
                 "kind": {

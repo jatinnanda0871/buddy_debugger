@@ -41,7 +41,13 @@ STOP_AT_MAIN = (
 )
 
 
+#: Bumped on every step, so -stack-list-variables can report a local that
+#: actually changes across stops -- needed to exercise locals-diffing.
+_step_count = 0
+
+
 def main() -> int:
+    global _step_count
     if "--interpreter=mi3" not in sys.argv and "--interpreter=mi2" not in sys.argv:
         sys.stderr.write("fake_gdb: expected --interpreter=mi2|mi3\n")
         return 1
@@ -104,6 +110,7 @@ def main() -> int:
             continue
 
         if command.startswith("-exec-step") or command.startswith("-exec-next"):
+            _step_count += 1
             emit(f"{token}^running")
             prompt()
             delayed_stop(
@@ -112,6 +119,14 @@ def main() -> int:
                 'frame={addr="0x40114a",func="main",file="t.c",line="6"},'
                 'thread-id="1"',
             )
+            continue
+
+        if command.startswith("-stack-list-variables"):
+            emit(
+                f'{token}^done,variables=[{{name="i",value="{_step_count}"}},'
+                f'{{name="total",value="42"}}]'
+            )
+            prompt()
             continue
 
         if command.startswith("-stack-list-frames"):
